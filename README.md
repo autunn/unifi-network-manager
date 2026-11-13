@@ -4,11 +4,11 @@
 
 **在 Windows 和 macOS 上管理 UniFi Network 策略。** 导入或导出 DNS、ACL 和防火墙基线，预览变更差异，并在写入前保存快照。
 
-[下载最新版本](https://github.com/autunn/unifi-policy-manager/releases/latest) · [macOS 使用说明](macos/README.md) · [报告问题](https://github.com/autunn/unifi-policy-manager/issues)
+[下载最新版本](https://github.com/autunn/unifi-network-manager/releases/latest) · [macOS 使用说明](macos/README.md) · [讨论区](https://github.com/autunn/unifi-network-manager/discussions) · [报告问题](https://github.com/autunn/unifi-network-manager/issues)
 
 
-[![Build](https://github.com/autunn/unifi-policy-manager/actions/workflows/build.yml/badge.svg)](https://github.com/autunn/unifi-policy-manager/actions/workflows/build.yml)
-[![Release](https://img.shields.io/github/v/release/autunn/unifi-policy-manager)](https://github.com/autunn/unifi-policy-manager/releases/latest)
+[![Build](https://github.com/autunn/unifi-network-manager/actions/workflows/build.yml/badge.svg)](https://github.com/autunn/unifi-network-manager/actions/workflows/build.yml)
+[![Release](https://img.shields.io/github/v/release/autunn/unifi-network-manager)](https://github.com/autunn/unifi-network-manager/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 UniFi Network 管理与策略工具，严格使用 Ubiquiti 官方 Integration API。

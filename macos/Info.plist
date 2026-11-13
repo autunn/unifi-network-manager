@@ -29,7 +29,7 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
-    <string>Based on autunn/unifi-policy-manager, MIT License</string>
+    <string>Based on autunn/unifi-network-manager, MIT License</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 </dict>
