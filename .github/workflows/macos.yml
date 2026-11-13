@@ -33,14 +33,14 @@ jobs:
         run: ./macos/build-app.sh
 
       - name: Verify application signature
-        run: codesign --verify --deep --strict --verbose=2 macos/dist/UniFi-Policy-Manager.app
+        run: codesign --verify --deep --strict --verbose=2 macos/dist/UniFi-Network-Manager.app
 
       - name: Package application bundle
-        run: ditto -c -k --sequesterRsrc --keepParent macos/dist/UniFi-Policy-Manager.app macos/dist/UniFi-Policy-Manager-macOS.zip
+        run: ditto -c -k --sequesterRsrc --keepParent macos/dist/UniFi-Network-Manager.app macos/dist/UniFi-Network-Manager-macOS.zip
 
       - name: Upload macOS application
         uses: actions/upload-artifact@v6
         with:
-          name: UniFi-Policy-Manager-macOS
-          path: macos/dist/UniFi-Policy-Manager-macOS.zip
+          name: UniFi-Network-Manager-macOS
+          path: macos/dist/UniFi-Network-Manager-macOS.zip
           if-no-files-found: error

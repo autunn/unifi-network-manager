@@ -265,4 +265,68 @@ final class FeatureParityTests: XCTestCase {
         XCTAssertEqual(strict.count(.delete), 1)
         XCTAssertEqual(strict.items.first(where: { $0.action == .delete })?.isSelected, false)
     }
+
+    func testBaselineDistinguishesMissingAndNullSections() throws {
+        let decoder = JSONDecoder()
+        for key in ["dns_records", "records", "acl_rules", "firewall_policies"] {
+            let input = Data("{\"\(key)\":null}".utf8)
+            XCTAssertThrowsError(try decoder.decode(PolicyBundle.self, from: input))
+        }
+        let legacy = try decoder.decode(PolicyBundle.self, from: Data("{\"records\":[]}".utf8))
+        let roundTrip = try decoder.decode(PolicyBundle.self, from: JSONEncoder().encode(legacy))
+        XCTAssertTrue(roundTrip.hasDNSSection)
+        XCTAssertFalse(roundTrip.hasACLSection)
+        XCTAssertFalse(roundTrip.hasFirewallSection)
+    }
+
+    func testSnapshotMatchesConsoleAndSite() {
+        let snapshot = PolicyBundle(target: "https://console.example.test:443/", siteID: "SITE-A")
+        XCTAssertTrue(snapshot.matchesSite(target: "https://CONSOLE.example.test", siteID: "site-a"))
+        XCTAssertFalse(snapshot.matchesSite(target: "https://another.example.test", siteID: "site-a"))
+        XCTAssertFalse(snapshot.matchesSite(target: "https://console.example.test", siteID: "site-b"))
+        XCTAssertFalse(PolicyBundle().matchesSite(target: "", siteID: ""))
+    }
+
+    func testPolicyPreviewRejectsLiveDNSDrift() {
+        let original = DNSRecord(id: "existing", recordType: "A", key: "demo.example.com", value: "192.0.2.1")
+        var changed = original
+        changed.value = "192.0.2.2"
+        let plan = PolicyChangeService.buildPlan(
+            bundle: PolicyBundle(dnsRecords: [original]), sourceURL: URL(fileURLWithPath: "/tmp/baseline.json"),
+            currentDNS: [original], currentACL: [], currentFirewall: [], synchronizeDeletes: true
+        )
+        XCTAssertTrue(PolicyChangeService.matchesPreview(
+            plan: plan, previousDNS: [original], currentDNS: [original],
+            previousACL: [], currentACL: [], previousFirewall: [], currentFirewall: []
+        ))
+        XCTAssertFalse(PolicyChangeService.matchesPreview(
+            plan: plan, previousDNS: [original], currentDNS: [changed],
+            previousACL: [], currentACL: [], previousFirewall: [], currentFirewall: []
+        ))
+    }
+
+    func testDuplicateLiveDNSIDsInvalidateScope() {
+        let live = [
+            DNSRecord(id: "same", recordType: "A", key: "one.example.com", value: "192.0.2.1"),
+            DNSRecord(id: "SAME", recordType: "A", key: "two.example.com", value: "192.0.2.2")
+        ]
+        let plan = PolicyChangeService.buildPlan(
+            bundle: PolicyBundle(), sourceURL: URL(fileURLWithPath: "/tmp/baseline.json"),
+            currentDNS: live, currentACL: [], currentFirewall: [], synchronizeDeletes: true
+        )
+        XCTAssertEqual(plan.count(.invalid), 1)
+        XCTAssertEqual(plan.count(.delete), 0)
+    }
+
+    func testCrossSiteDNSPlanIgnoresCoincidentalSourceID() {
+        let foreign = DNSRecord(id: "same", recordType: "A", key: "wanted.example.com", value: "192.0.2.1")
+        let unrelated = DNSRecord(id: "same", recordType: "A", key: "different.example.com", value: "192.0.2.2")
+        let plan = PolicyChangeService.buildPlan(
+            bundle: PolicyBundle(dnsRecords: [foreign]), sourceURL: URL(fileURLWithPath: "/tmp/baseline.json"),
+            currentDNS: [unrelated], currentACL: [], currentFirewall: [], synchronizeDeletes: false,
+            matchSourceIDs: false
+        )
+        XCTAssertEqual(plan.count(.add), 1)
+        XCTAssertEqual(plan.count(.update), 0)
+    }
 }

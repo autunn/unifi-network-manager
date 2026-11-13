@@ -18,7 +18,7 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<OfficialPolicyRule> _aclRules = [];
     private readonly ObservableCollection<OfficialPolicyRule> _firewallRules = [];
     private readonly ObservableCollection<PolicyChangeItem> _changePlanItems = [];
-    private readonly BackupService _backupService = new();
+    private readonly BackupService _backupService;
     private readonly SecureSettingsService _secureSettingsService = new();
     private readonly bool _demoMode;
     private ICollectionView? _view;
@@ -30,18 +30,22 @@ public partial class MainWindow : Window
     private PolicyBundle? _loadedBundle;
     private string? _loadedBundlePath;
     private PolicyChangePlan? _changePlan;
+    private PolicyBundle? _previewedSite;
     private string? _lastChangePlanBackupPath;
     private bool _uiReady;
+    private bool _isBusy;
 
     private string SelectedDnsType => (DnsTypeTabs?.SelectedItem as TabItem)?.Tag?.ToString() ?? "NS";
 
     public MainWindow(bool demoMode = false)
     {
+        _demoMode = demoMode;
+        _backupService = new BackupService(demoMode ? Path.Combine(Path.GetTempPath(), "UniFiNetworkManager-demo") : null);
         InitializeComponent();
+        OfficialApiPage.SetAuditService(_backupService);
         OfficialApiPage.StatusChanged += (_, message) => SetStatus(message, message.Contains("失败", StringComparison.Ordinal));
         VisualResourcePage.StatusChanged += (_, message) => SetStatus(message, message.Contains("失败", StringComparison.Ordinal));
         _uiReady = true;
-        _demoMode = demoMode;
         if (!_demoMode) LoadConnectionSettings();
         Loaded += MainWindow_Loaded;
         Closing += (_, _) => _client?.Dispose();
@@ -181,6 +185,19 @@ public partial class MainWindow : Window
         });
     }
 
+    private void StartDemoButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_isBusy) SwitchWindow(demoMode: true);
+    }
+
+    private void SwitchWindow(bool demoMode)
+    {
+        var window = new MainWindow(demoMode);
+        Application.Current.MainWindow = window;
+        window.Show();
+        Close();
+    }
+
     private void ShowWorkspace()
     {
         if (_client is null) return;
@@ -210,7 +227,10 @@ public partial class MainWindow : Window
         _firewallRules.Clear();
         _policyReferences = [];
         _lastOperation = null;
+        _lastChangePlanBackupPath = null;
+        RestoreLastPlanButton.IsEnabled = false;
         ClearLoadedPlan();
+        SynchronizeDeleteCheckBox.IsChecked = false;
         UpdateUndoState();
         if (!_demoMode) LoadConnectionSettings();
     }
@@ -256,8 +276,11 @@ public partial class MainWindow : Window
 
     private async Task RefreshRecordsAsync()
     {
-        var client = RequireClient();
-        var records = await client.ListRecordsAsync();
+        UpdateDnsRecords(await RequireClient().ListRecordsAsync());
+    }
+
+    private void UpdateDnsRecords(IReadOnlyList<DnsRecord> records)
+    {
         var order = DnsTypes.All.Select((type, index) => (type, index)).ToDictionary(item => item.type, item => item.index);
         var sorted = records.OrderBy(record => order.GetValueOrDefault(record.RecordType, 99)).ThenBy(record => record.Key, StringComparer.OrdinalIgnoreCase).ThenBy(record => record.Value, StringComparer.OrdinalIgnoreCase).ToList();
         _records.Clear();
@@ -279,7 +302,11 @@ public partial class MainWindow : Window
 
     private async Task RefreshPoliciesAsync(OfficialPolicyKind kind)
     {
-        var items = await RequireClient().ListPoliciesAsync(kind);
+        UpdatePolicyRules(kind, await RequireClient().ListPoliciesAsync(kind));
+    }
+
+    private void UpdatePolicyRules(OfficialPolicyKind kind, IReadOnlyList<OfficialPolicyRule> items)
+    {
         var target = kind == OfficialPolicyKind.Acl ? _aclRules : _firewallRules;
         target.Clear();
         foreach (var item in items.OrderBy(item => item.Index)) target.Add(item);
@@ -289,11 +316,27 @@ public partial class MainWindow : Window
 
     private async Task RefreshAllAsync()
     {
+        if (_changePlan is { } plan && _previewedSite is { } preview)
+        {
+            var current = await CaptureBundleAsync();
+            UpdatePolicyLists(current);
+            _previewedSite = current;
+            if (!PolicyChangeService.PreviewMatches(plan, preview, current))
+                RebuildChangePlan(clearSelection: true);
+            _policyReferences = await RequireClient().ListPolicyReferencesAsync();
+            return;
+        }
         await RefreshRecordsAsync();
         await RefreshPoliciesAsync(OfficialPolicyKind.Acl);
         await RefreshPoliciesAsync(OfficialPolicyKind.Firewall);
         _policyReferences = await RequireClient().ListPolicyReferencesAsync();
-        if (_loadedBundle is not null) RebuildChangePlan();
+    }
+
+    private void UpdatePolicyLists(PolicyBundle current)
+    {
+        UpdateDnsRecords(current.DnsRecords.Select(record => record.Clone()).ToList());
+        UpdatePolicyRules(OfficialPolicyKind.Acl, current.AclRules.Select(item => OfficialPolicyRule.Parse(OfficialPolicyKind.Acl, item)).ToList());
+        UpdatePolicyRules(OfficialPolicyKind.Firewall, current.FirewallPolicies.Select(item => OfficialPolicyRule.Parse(OfficialPolicyKind.Firewall, item)).ToList());
     }
 
     private bool FilterRecord(object item)
@@ -616,26 +659,39 @@ public partial class MainWindow : Window
         if (dialog.ShowDialog(this) != true) return;
         await RunBusyAsync("正在读取策略基线并计算差异…", async () =>
         {
-            _loadedBundle = await PolicyChangeService.LoadBundleAsync(dialog.FileName);
+            var bundle = await PolicyChangeService.LoadBundleAsync(dialog.FileName);
+            var current = await CaptureBundleAsync();
+            _loadedBundle = bundle;
             _loadedBundlePath = dialog.FileName;
+            _previewedSite = current;
+            UpdatePolicyLists(current);
             RebuildChangePlan();
-            PlanSourceText.Text = $"{Path.GetFileName(dialog.FileName)} · Site {_loadedBundle.Site ?? "未知"} · {_loadedBundle.CreatedAt:yyyy-MM-dd HH:mm:ss}";
-            if (!string.IsNullOrWhiteSpace(_loadedBundle.SiteId) && !string.Equals(_loadedBundle.SiteId, RequireClient().SiteId, StringComparison.OrdinalIgnoreCase))
-                MessageBox.Show(this, "该基线来自另一个 Site。程序会按策略名称和内容匹配，但网络、区域等 UUID 必须在当前站点中有效。", "跨站点基线", MessageBoxButton.OK, MessageBoxImage.Warning);
-            SetStatus($"已载入策略基线：DNS {_loadedBundle.DnsRecords.Count}、ACL {_loadedBundle.AclRules.Count}、防火墙 {_loadedBundle.FirewallPolicies.Count}。" );
+            PlanSourceText.Text = $"{Path.GetFileName(dialog.FileName)} · 来源 {bundle.Target ?? "未知 Console"} / {bundle.Site ?? "未知站点"} · {bundle.CreatedAt:yyyy-MM-dd HH:mm:ss}";
+            if ((bundle.Target is not null || bundle.SiteId is not null) &&
+                !PolicyChangeService.IsSameSite(bundle, current.Target, current.SiteId))
+                MessageBox.Show(this, $"基线来源与当前连接不同。请确认目标 Console 和站点：\n{current.Target} / {current.Site}\n\n将按 DNS 规则内容或策略名称匹配。网络和防火墙区域等引用 ID 必须在目标站点中有效。", "核对基线来源", MessageBoxButton.OK, MessageBoxImage.Warning);
+            SetStatus($"已载入策略基线：DNS {bundle.DnsRecords.Count}、ACL {bundle.AclRules.Count}、防火墙 {bundle.FirewallPolicies.Count}。");
         });
     }
 
     private async void RestoreLastPlanButton_Click(object sender, RoutedEventArgs e)
     {
-        if (string.IsNullOrWhiteSpace(_lastChangePlanBackupPath) || !File.Exists(_lastChangePlanBackupPath)) return;
+        var path = _lastChangePlanBackupPath;
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return;
         await RunBusyAsync("正在载入上次执行前快照…", async () =>
         {
-            _loadedBundle = await PolicyChangeService.LoadBundleAsync(_lastChangePlanBackupPath);
-            _loadedBundlePath = _lastChangePlanBackupPath;
+            var client = RequireClient();
+            var bundle = await PolicyChangeService.LoadBundleAsync(path);
+            if (!PolicyChangeService.IsSameSite(bundle, client.Target, client.SiteId))
+                throw new ValidationException("此快照与当前 Console 或站点不匹配，无法通过恢复入口载入。");
+            var current = await CaptureBundleAsync();
+            _loadedBundle = bundle;
+            _loadedBundlePath = path;
+            _previewedSite = current;
+            UpdatePolicyLists(current);
             SynchronizeDeleteCheckBox.IsChecked = true;
             RebuildChangePlan();
-            PlanSourceText.Text = $"恢复快照 · {Path.GetFileName(_lastChangePlanBackupPath)}";
+            PlanSourceText.Text = $"恢复快照 · {Path.GetFileName(path)}";
             SetStatus("已载入上次执行前快照，请检查删除项后再执行恢复计划。" );
         });
     }
@@ -646,9 +702,9 @@ public partial class MainWindow : Window
         RebuildChangePlan();
     }
 
-    private void RebuildChangePlan()
+    private void RebuildChangePlan(bool clearSelection = false)
     {
-        if (_loadedBundle is null || string.IsNullOrWhiteSpace(_loadedBundlePath))
+        if (_loadedBundle is null || _previewedSite is null || string.IsNullOrWhiteSpace(_loadedBundlePath))
         {
             ClearLoadedPlan();
             return;
@@ -658,13 +714,12 @@ public partial class MainWindow : Window
         _changePlan = PolicyChangeService.BuildPlan(
             _loadedBundle,
             _loadedBundlePath,
-            _records.ToList(),
-            _aclRules.ToList(),
-            _firewallRules.ToList(),
+            _previewedSite,
             SynchronizeDeleteCheckBox.IsChecked == true);
         _changePlanItems.Clear();
         foreach (var item in _changePlan.Items)
         {
+            if (clearSelection) item.IsSelected = false;
             item.PropertyChanged += ChangePlanItem_PropertyChanged;
             _changePlanItems.Add(item);
         }
@@ -678,6 +733,7 @@ public partial class MainWindow : Window
         _loadedBundle = null;
         _loadedBundlePath = null;
         _changePlan = null;
+        _previewedSite = null;
         if (!_uiReady || PlanSourceText is null) return;
         PlanSourceText.Text = "尚未载入。可导入本程序导出的 JSON 基线或自动备份。";
         PlanSummaryText.Text = "载入基线后显示差异。";
@@ -702,7 +758,7 @@ public partial class MainWindow : Window
         PlanInvalidCount.Text = _changePlan.InvalidCount.ToString();
         var selected = _changePlan.SelectedCount;
         var selectedDeletes = _changePlan.Items.Count(item => item.IsSelected && item.Action == PolicyChangeAction.Delete);
-        PlanSummaryText.Text = $"共 {_changePlan.Items.Count} 项差异；默认只选择新增和更新。{(_changePlan.SynchronizeDeletes ? "严格同步已开启，将恢复用户策略排序；删除项仍需手动选择。" : "当前不会删除现有策略，也不会改动排序。")}{(_changePlan.InvalidCount > 0 ? " 存在无效项的策略范围已自动禁止删除。" : string.Empty)}";
+        PlanSummaryText.Text = $"共 {_changePlan.Items.Count} 项差异。{(_changePlan.SynchronizeDeletes ? "严格同步已开启，将恢复用户策略排序；请检查所选删除项。" : "当前不会删除现有策略，也不会改动排序。")}{(_changePlan.InvalidCount > 0 ? " 存在无效项的策略范围已自动禁止删除。" : string.Empty)}";
         PlanSelectedText.Text = $"已选择 {selected} 项{(selectedDeletes > 0 ? $"，其中删除 {selectedDeletes} 项" : string.Empty)}。";
         ExecutePlanButton.IsEnabled = selected > 0;
         var hasOrdering = _changePlan.Bundle.AclOrdering is { OrderedAclRuleIds.Count: > 0 } ||
@@ -739,15 +795,17 @@ public partial class MainWindow : Window
         if (MessageBox.Show(this, "确定按导入基线恢复 ACL 和防火墙用户策略顺序吗？\n\n执行前会保存完整快照。", "恢复策略排序", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
         await RunBusyAsync("正在恢复用户策略排序…", async () =>
         {
-            var before = await CaptureBundleAsync();
+            var before = await RevalidatePreviewAsync(plan);
+            if (before is null) return;
             var backup = await _backupService.SaveObjectSnapshotAsync("before-order-restore", before);
             _lastChangePlanBackupPath = backup;
             RestoreLastPlanButton.IsEnabled = true;
             ResolvePlanActualIds(plan);
             await PolicyChangeExecutor.RestoreOrderingAsync(RequireClient(), plan);
-            await RefreshPoliciesAsync(OfficialPolicyKind.Acl);
-            await RefreshPoliciesAsync(OfficialPolicyKind.Firewall);
             await _backupService.LogOperationAsync(new { kind = "restore_policy_ordering", source = plan.SourcePath, backup });
+            _previewedSite = await CaptureBundleAsync();
+            UpdatePolicyLists(_previewedSite);
+            RebuildChangePlan(clearSelection: true);
             SetStatus("ACL 与防火墙用户策略排序已按基线恢复。" );
         });
     }
@@ -765,7 +823,8 @@ public partial class MainWindow : Window
 
         await RunBusyAsync($"正在执行 {selected.Count} 项策略变更…", async () =>
         {
-            var before = await CaptureBundleAsync();
+            var before = await RevalidatePreviewAsync(plan);
+            if (before is null) return;
             var backup = await _backupService.SaveObjectSnapshotAsync("before-change-plan", before);
             _lastChangePlanBackupPath = backup;
             RestoreLastPlanButton.IsEnabled = true;
@@ -787,13 +846,14 @@ public partial class MainWindow : Window
                 await Task.Delay(60);
             }
 
-            await RefreshAllAsync();
+            var afterChanges = await CaptureBundleAsync();
+            UpdatePolicyLists(afterChanges);
             if (failures.Count == 0 && plan.SynchronizeDeletes)
             {
                 ResolvePlanActualIds(plan);
                 await PolicyChangeExecutor.RestoreOrderingAsync(client, plan);
-                await RefreshPoliciesAsync(OfficialPolicyKind.Acl);
-                await RefreshPoliciesAsync(OfficialPolicyKind.Firewall);
+                afterChanges = await CaptureBundleAsync();
+                UpdatePolicyLists(afterChanges);
             }
             await _backupService.LogOperationAsync(new
             {
@@ -804,11 +864,27 @@ public partial class MainWindow : Window
                 failures,
                 backup
             });
-            RebuildChangePlan();
+            _previewedSite = afterChanges;
+            RebuildChangePlan(clearSelection: true);
             SetStatus($"策略变更完成：成功 {selected.Count - failures.Count} 项，失败 {failures.Count} 项。", failures.Count > 0);
             if (failures.Count > 0)
                 MessageBox.Show(this, string.Join(Environment.NewLine, failures.Take(25)), "部分变更失败", MessageBoxButton.OK, MessageBoxImage.Warning);
         });
+    }
+
+    private async Task<PolicyBundle?> RevalidatePreviewAsync(PolicyChangePlan plan)
+    {
+        var current = await CaptureBundleAsync();
+        if (!ReferenceEquals(plan, _changePlan) || _previewedSite is null) return null;
+        if (PolicyChangeService.PreviewMatches(plan, _previewedSite, current)) return current;
+
+        _previewedSite = current;
+        UpdatePolicyLists(current);
+        RebuildChangePlan(clearSelection: true);
+        const string message = "当前站点的策略或顺序已变更。差异已更新，请重新检查并选择要执行的变更。";
+        SetStatus(message, error: true);
+        MessageBox.Show(this, message, "请重新检查策略差异", MessageBoxButton.OK, MessageBoxImage.Warning);
+        return null;
     }
 
     private void ResolvePlanActualIds(PolicyChangePlan plan)
@@ -1077,6 +1153,12 @@ public partial class MainWindow : Window
 
     private void LogoutButton_Click(object sender, RoutedEventArgs e)
     {
+        if (_isBusy) return;
+        if (_demoMode)
+        {
+            SwitchWindow(demoMode: false);
+            return;
+        }
         _client?.Dispose();
         _client = null;
         ShowLogin();
@@ -1097,6 +1179,10 @@ public partial class MainWindow : Window
 
     private async Task RunBusyAsync(string message, Func<Task> action)
     {
+        if (_isBusy) return;
+        _isBusy = true;
+        LoginPanel.IsEnabled = false;
+        WorkspacePanel.IsEnabled = false;
         BusyText.Text = message;
         BusyOverlay.Visibility = Visibility.Visible;
         try { await action(); }
@@ -1104,6 +1190,9 @@ public partial class MainWindow : Window
         finally
         {
             BusyOverlay.Visibility = Visibility.Collapsed;
+            LoginPanel.IsEnabled = true;
+            WorkspacePanel.IsEnabled = true;
+            _isBusy = false;
         }
     }
 

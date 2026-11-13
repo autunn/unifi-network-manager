@@ -240,6 +240,27 @@ struct PolicyBundle: Codable {
     var hasACLSection = true
     var hasFirewallSection = true
 
+    func matchesSite(target: String, siteID: String) -> Bool {
+        let sourceTarget = Self.canonicalTarget(self.target)
+        let sourceSiteID = self.siteID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !sourceTarget.isEmpty && !sourceSiteID.isEmpty
+            && sourceTarget == Self.canonicalTarget(target)
+            && sourceSiteID.caseInsensitiveCompare(siteID.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame
+    }
+
+    private static func canonicalTarget(_ target: String) -> String {
+        let value = target.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard var components = URLComponents(string: value), let scheme = components.scheme,
+              components.host != nil, components.path.isEmpty || components.path == "/" else {
+            return value
+        }
+        components.path = ""
+        if (scheme == "https" && components.port == 443) || (scheme == "http" && components.port == 80) {
+            components.port = nil
+        }
+        return components.string ?? value
+    }
+
     enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
         case createdAt = "created_at"
@@ -284,11 +305,11 @@ struct PolicyBundle: Codable {
         hasDNSSection = container.contains(.dnsRecords) || container.contains(.legacyRecords)
         hasACLSection = container.contains(.aclRules)
         hasFirewallSection = container.contains(.firewallPolicies)
-        dnsRecords = try container.decodeIfPresent([DNSRecord].self, forKey: .dnsRecords)
-            ?? container.decodeIfPresent([DNSRecord].self, forKey: .legacyRecords)
-            ?? []
-        aclRules = try container.decodeIfPresent([JSONValue].self, forKey: .aclRules) ?? []
-        firewallPolicies = try container.decodeIfPresent([JSONValue].self, forKey: .firewallPolicies) ?? []
+        let currentDNS = container.contains(.dnsRecords) ? try container.decode([DNSRecord].self, forKey: .dnsRecords) : nil
+        let legacyDNS = container.contains(.legacyRecords) ? try container.decode([DNSRecord].self, forKey: .legacyRecords) : nil
+        dnsRecords = currentDNS ?? legacyDNS ?? []
+        aclRules = hasACLSection ? try container.decode([JSONValue].self, forKey: .aclRules) : []
+        firewallPolicies = hasFirewallSection ? try container.decode([JSONValue].self, forKey: .firewallPolicies) : []
         aclOrdering = try container.decodeIfPresent(PolicyOrderingSnapshot.self, forKey: .aclOrdering)
         firewallOrdering = try container.decodeIfPresent(PolicyOrderingSnapshot.self, forKey: .firewallOrdering)
     }
@@ -301,9 +322,9 @@ struct PolicyBundle: Codable {
         try container.encode(site, forKey: .site)
         try container.encode(siteID, forKey: .siteID)
         try container.encode(networkVersion, forKey: .networkVersion)
-        try container.encode(dnsRecords, forKey: .dnsRecords)
-        try container.encode(aclRules, forKey: .aclRules)
-        try container.encode(firewallPolicies, forKey: .firewallPolicies)
+        if hasDNSSection { try container.encode(dnsRecords, forKey: .dnsRecords) }
+        if hasACLSection { try container.encode(aclRules, forKey: .aclRules) }
+        if hasFirewallSection { try container.encode(firewallPolicies, forKey: .firewallPolicies) }
         try container.encodeIfPresent(aclOrdering, forKey: .aclOrdering)
         try container.encodeIfPresent(firewallOrdering, forKey: .firewallOrdering)
     }

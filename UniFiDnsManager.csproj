@@ -6,11 +6,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>UniFiDnsManager</RootNamespace>
-    <AssemblyName>UniFi-Policy-Manager</AssemblyName>
+    <AssemblyName>UniFi-Network-Manager</AssemblyName>
     <Version>4.1.1</Version>
     <AssemblyVersion>4.1.1.0</AssemblyVersion>
     <FileVersion>4.1.1.0</FileVersion>
-    <Product>UniFi Policy Manager</Product>
+    <Product>UniFi Network Manager</Product>
     <Company>Local Utility</Company>
     <Description>Official UniFi Network Integration API and policy manager</Description>
     <ApplicationIcon>Assets\UniFi.ico</ApplicationIcon>

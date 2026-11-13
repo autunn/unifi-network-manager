@@ -42,6 +42,9 @@ struct PolicyChangeItem: Identifiable {
     var desiredPolicyJSON: String?
     var isSelected = false
     var status = "待执行"
+    var applied = false
+
+    var canExecute: Bool { action.actionable && !applied }
 }
 
 struct PolicyChangePlan {
@@ -81,18 +84,41 @@ enum PolicyBundleCodec {
 }
 
 enum PolicyChangeService {
+    static func matchesPreview(
+        plan: PolicyChangePlan,
+        previousDNS: [DNSRecord], currentDNS: [DNSRecord],
+        previousACL: [PolicyRule], currentACL: [PolicyRule],
+        previousFirewall: [PolicyRule], currentFirewall: [PolicyRule]
+    ) -> Bool {
+        (!plan.bundle.hasDNSSection || Set(previousDNS) == Set(currentDNS))
+            && (!plan.bundle.hasACLSection || matchesPolicies(previousACL, currentACL))
+            && (!plan.bundle.hasFirewallSection || matchesPolicies(previousFirewall, currentFirewall))
+    }
+
+    private static func matchesPolicies(_ previous: [PolicyRule], _ current: [PolicyRule]) -> Bool {
+        let previousEditable = previous.filter(\.canModify)
+        let currentEditable = current.filter(\.canModify)
+        guard previousEditable.count == currentEditable.count else { return false }
+        let previousByID = Dictionary(grouping: previousEditable, by: \.id)
+        return currentEditable.allSatisfy { rule in
+            guard let matches = previousByID[rule.id], matches.count == 1, let match = matches.first else { return false }
+            return rule.editableJSON == match.editableJSON
+        } && Set(previousByID.keys) == Set(currentEditable.map(\.id))
+    }
+
     static func buildPlan(
         bundle: PolicyBundle,
         sourceURL: URL,
         currentDNS: [DNSRecord],
         currentACL: [PolicyRule],
         currentFirewall: [PolicyRule],
-        synchronizeDeletes: Bool
+        synchronizeDeletes: Bool,
+        matchSourceIDs: Bool = true
     ) -> PolicyChangePlan {
         var items: [PolicyChangeItem] = []
-        if bundle.hasDNSSection { buildDNSItems(&items, desiredRecords: bundle.dnsRecords, currentRecords: currentDNS, synchronizeDeletes: synchronizeDeletes) }
-        if bundle.hasACLSection { buildPolicyItems(&items, kind: .acl, desiredValues: bundle.aclRules, currentRules: currentACL, synchronizeDeletes: synchronizeDeletes) }
-        if bundle.hasFirewallSection { buildPolicyItems(&items, kind: .firewall, desiredValues: bundle.firewallPolicies, currentRules: currentFirewall, synchronizeDeletes: synchronizeDeletes) }
+        if bundle.hasDNSSection { buildDNSItems(&items, desiredRecords: bundle.dnsRecords, currentRecords: currentDNS, synchronizeDeletes: synchronizeDeletes, matchSourceIDs: matchSourceIDs) }
+        if bundle.hasACLSection { buildPolicyItems(&items, kind: .acl, desiredValues: bundle.aclRules, currentRules: currentACL, synchronizeDeletes: synchronizeDeletes, matchSourceIDs: matchSourceIDs) }
+        if bundle.hasFirewallSection { buildPolicyItems(&items, kind: .firewall, desiredValues: bundle.firewallPolicies, currentRules: currentFirewall, synchronizeDeletes: synchronizeDeletes, matchSourceIDs: matchSourceIDs) }
         for index in items.indices where items[index].action == .add || items[index].action == .update { items[index].isSelected = true }
         items.sort {
             let left = (scopeOrder($0.scope), actionOrder($0.action), $0.desiredIndex, $0.name.lowercased())
@@ -123,9 +149,16 @@ enum PolicyChangeService {
     }
 
     private static func buildDNSItems(
-        _ items: inout [PolicyChangeItem], desiredRecords: [DNSRecord], currentRecords: [DNSRecord], synchronizeDeletes: Bool
+        _ items: inout [PolicyChangeItem], desiredRecords: [DNSRecord], currentRecords: [DNSRecord],
+        synchronizeDeletes: Bool, matchSourceIDs: Bool
     ) {
-        let currentByID = Dictionary(uniqueKeysWithValues: currentRecords.compactMap { record in record.id.map { ($0.lowercased(), record) } })
+        let currentByID = Dictionary(grouping: currentRecords.compactMap { record in
+            record.id.map { (id: $0.lowercased(), record: record) }
+        }, by: \.id)
+        guard currentByID.values.allSatisfy({ $0.count == 1 }) else {
+            items.append(invalid(.dns, name: "当前站点", details: "读取到重复的 DNS 记录 ID，请刷新后重试。"))
+            return
+        }
         let grouped = Dictionary(grouping: currentRecords, by: DNSImportService.identity)
         var desiredKeys = Set<String>()
         var matchedCurrent = Set<String>()
@@ -139,7 +172,8 @@ enum PolicyChangeService {
                     items.append(invalid(.dns, name: desired.key, details: "目标文件中存在重复 DNS 规则。"))
                     continue
                 }
-                let byID = desired.id.flatMap { currentByID[$0.lowercased()] }.flatMap { matchedCurrent.contains($0.stableID) ? nil : $0 }
+                let sourceID = matchSourceIDs ? desired.id : nil
+                let byID = sourceID.flatMap { currentByID[$0.lowercased()]?.first?.record }.flatMap { matchedCurrent.contains($0.stableID) ? nil : $0 }
                 let current = byID ?? grouped[key]?.first(where: { !matchedCurrent.contains($0.stableID) })
                 guard let current else {
                     items.append(PolicyChangeItem(scope: .dns, action: .add, name: "\(desired.typeLabel) · \(desired.key)", details: DNSImportService.describe(desired), desiredDNS: desired))
@@ -170,7 +204,8 @@ enum PolicyChangeService {
     }
 
     private static func buildPolicyItems(
-        _ items: inout [PolicyChangeItem], kind: PolicyKind, desiredValues: [JSONValue], currentRules: [PolicyRule], synchronizeDeletes: Bool
+        _ items: inout [PolicyChangeItem], kind: PolicyKind, desiredValues: [JSONValue], currentRules: [PolicyRule],
+        synchronizeDeletes: Bool, matchSourceIDs: Bool
     ) {
         let scope: PolicyChangeScope = kind == .acl ? .acl : .firewall
         let currentUserRules = currentRules.filter(\.canModify)
@@ -189,7 +224,8 @@ enum PolicyChangeService {
             do {
                 let editable = try editablePolicyJSON(kind: kind, value: value)
                 let sourceID = policyID(value)
-                let current = sourceID.flatMap { desiredID in
+                let matchID = matchSourceIDs ? sourceID : nil
+                let current = matchID.flatMap { desiredID in
                     currentUserRules.first(where: { unmatched.contains($0.id) && $0.id.caseInsensitiveCompare(desiredID) == .orderedSame })
                 } ?? currentUserRules.first(where: {
                     unmatched.contains($0.id) && $0.name.caseInsensitiveCompare(name) == .orderedSame
@@ -249,7 +285,7 @@ enum PolicyChangeService {
 
     private static func policyIndex(_ value: JSONValue) -> Int {
         guard case .object(let object) = value, case .number(let number)? = object["index"] else { return 0 }
-        return Int(number)
+        return Int(exactly: number) ?? 0
     }
 
     private static func policyOrigin(_ value: JSONValue) -> String? {

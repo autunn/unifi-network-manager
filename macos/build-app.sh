@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")" && pwd)
 REPOSITORY_ROOT=$(cd "$ROOT/.." && pwd)
-APP="$ROOT/dist/UniFi-Policy-Manager.app"
+APP="$ROOT/dist/UniFi-Network-Manager.app"
 SIGNING_IDENTITY="${MACOS_SIGNING_IDENTITY:--}"
 
 swift build --package-path "$ROOT" -c release --disable-sandbox

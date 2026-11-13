@@ -19,6 +19,8 @@ public static class SelfTest
             catch (Exception ex) { success = false; tests.Add(new { name, ok = false, error = ex.ToString() }); }
         }
 
+        await CheckAsync("unifi_pagination_rejects_incomplete_results", UniFiPaginationTests.RunAsync);
+
         await CheckAsync("validate_all_dns_types", () =>
         {
             foreach (var item in AllRecordTypes()) _ = DnsValidator.Normalize(item);
@@ -519,6 +521,105 @@ public static class SelfTest
                 synchronizeDeletes: true);
             if (plan.InvalidCount == 0 || plan.DeleteCount != 0)
                 throw new Exception("Invalid DNS input did not suppress strict-sync deletion items.");
+        });
+
+        await CheckAsync("policy_preview_detects_remote_drift", async () =>
+        {
+            using var client = new DemoUniFiClient();
+            async Task<PolicyBundle> ReadCurrentAsync() => PolicyChangeService.CaptureBundle(
+                client, await client.ListRecordsAsync(),
+                await client.ListPoliciesAsync(OfficialPolicyKind.Acl),
+                await client.ListPoliciesAsync(OfficialPolicyKind.Firewall),
+                await client.GetPolicyOrderingAsync(OfficialPolicyKind.Acl),
+                await client.GetPolicyOrderingAsync(OfficialPolicyKind.Firewall));
+
+            var preview = await ReadCurrentAsync();
+            var desired = await ReadCurrentAsync();
+            desired.DnsRecords[0].Value = "192.168.1.53";
+            var plan = PolicyChangeService.BuildPlan(desired, "preview.json", preview, synchronizeDeletes: true);
+            var current = await ReadCurrentAsync();
+            current.DnsRecords.Reverse();
+            if (!PolicyChangeService.PreviewMatches(plan, preview, current))
+                throw new Exception("A change in list response order invalidated an unchanged preview.");
+
+            current.DnsRecords.Single(record => record.Id == preview.DnsRecords[0].Id).Value = "192.168.1.54";
+            if (PolicyChangeService.PreviewMatches(plan, preview, current))
+                throw new Exception("A remote update to an already modified DNS rule did not invalidate the preview.");
+
+            current = await ReadCurrentAsync();
+            var changedAcl = JsonNode.Parse(current.AclRules[0].GetRawText())!.AsObject();
+            changedAcl["description"] = "Changed in UniFi";
+            current.AclRules[0] = ParseElement(changedAcl.ToJsonString());
+            if (PolicyChangeService.PreviewMatches(plan, preview, current))
+                throw new Exception("A remote ACL change did not invalidate the preview.");
+
+            current = await ReadCurrentAsync();
+            current.FirewallOrdering!.BeforeSystemDefined.Add("new-id");
+            if (PolicyChangeService.PreviewMatches(plan, preview, current))
+                throw new Exception("A change in firewall ordering did not invalidate the strict-sync preview.");
+        });
+
+        await CheckAsync("policy_restore_requires_matching_console_and_site", () =>
+        {
+            var snapshot = new PolicyBundle { Target = "https://gateway", SiteId = "site-a" };
+            if (!PolicyChangeService.IsSameSite(snapshot, "https://GATEWAY", "site-A") ||
+                PolicyChangeService.IsSameSite(snapshot, "https://other-gateway", "site-a") ||
+                PolicyChangeService.IsSameSite(snapshot, "https://gateway", "site-b") ||
+                PolicyChangeService.IsSameSite(new PolicyBundle { SiteId = "site-a" }, "https://gateway", "site-a"))
+                throw new Exception("Restore did not require the same console and site.");
+            return Task.CompletedTask;
+        });
+
+        await CheckAsync("cross_site_baseline_ignores_source_rule_ids", async () =>
+        {
+            using var client = new DemoUniFiClient();
+            var dns = await client.ListRecordsAsync();
+            var acl = await client.ListPoliciesAsync(OfficialPolicyKind.Acl);
+            var current = PolicyChangeService.CaptureBundle(client, dns, acl, [], null, null);
+            var desired = PolicyChangeService.CaptureBundle(client, dns.Take(1).ToList(), acl.Take(1).ToList(), [], null, null);
+            desired.Target = "https://other-gateway";
+            desired.DnsRecords[0].Key = "migrated.example.com";
+            var renamedAcl = JsonNode.Parse(desired.AclRules[0].GetRawText())!.AsObject();
+            renamedAcl["name"] = "另一站点的 ACL";
+            desired.AclRules[0] = ParseElement(renamedAcl.ToJsonString());
+
+            var foreign = PolicyChangeService.BuildPlan(desired, "foreign.json", current, synchronizeDeletes: false);
+            if (foreign.AddCount != 2 || foreign.UpdateCount != 0)
+                throw new Exception("A foreign rule ID was used to update a local rule.");
+
+            desired.Target = current.Target;
+            var local = PolicyChangeService.BuildPlan(desired, "local.json", current, synchronizeDeletes: false);
+            if (local.AddCount != 0 || local.UpdateCount != 2)
+                throw new Exception("An existing local rule could not be matched by its ID.");
+        });
+
+        await CheckAsync("invalid_baseline_collections_cannot_become_empty_scopes", async () =>
+        {
+            var temp = Path.Combine(Path.GetTempPath(), $"unifi-invalid-baseline-{Guid.NewGuid():N}.json");
+            try
+            {
+                foreach (var invalid in new[]
+                {
+                    """{"records":null}""",
+                    """{"DNS_RECORDS":null}""",
+                    """{"acl_rules":[null]}""",
+                    """{"firewall_policies":[1]}""",
+                    """{"acl_rules":[],"acl_ordering":{"ordered_acl_rule_ids":null}}""",
+                    """{"dns_records":[],"DNS_RECORDS":[]}"""
+                })
+                {
+                    await File.WriteAllTextAsync(temp, invalid);
+                    try { await PolicyChangeService.LoadBundleAsync(temp); }
+                    catch (ValidationException) { continue; }
+                    throw new Exception($"Accepted an invalid policy baseline: {invalid}");
+                }
+
+                await File.WriteAllTextAsync(temp, """{"DNS_RECORDS":[],"acl_ordering":null,"firewall_ordering":null}""");
+                var valid = await PolicyChangeService.LoadBundleAsync(temp);
+                if (!valid.HasDnsSection || valid.HasAclSection || valid.HasFirewallSection || valid.DnsRecords.Count != 0)
+                    throw new Exception("An explicitly empty DNS scope was not preserved.");
+            }
+            finally { File.Delete(temp); }
         });
 
         await CheckAsync("xlsx_domain_column", () =>

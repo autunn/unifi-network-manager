@@ -1,5 +1,4 @@
 using System.Collections.ObjectModel;
-using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -23,8 +22,11 @@ public partial class VisualResourceWorkspace : UserControl
     private string _moduleId = "devices";
     private OfficialApiOperation? _primaryOperation;
     private OfficialResourceItem? _selectedItem;
+    private string? _loadedOperationId;
+    private string? _loadError;
     private bool _changingModule;
     private int _loadVersion;
+    private CancellationTokenSource? _listCancellation;
 
     public event EventHandler<string>? StatusChanged;
 
@@ -40,7 +42,11 @@ public partial class VisualResourceWorkspace : UserControl
 
     public void SetClient(IUniFiClient? client)
     {
+        _loadVersion++;
+        _listCancellation?.Cancel();
+        SetLoading(false, "");
         _client = client;
+        ClearLoadedList();
         UpdateActionState();
     }
 
@@ -56,9 +62,7 @@ public partial class VisualResourceWorkspace : UserControl
         _moduleId = moduleId;
         _listOperations.Clear();
         _otherOperations.Clear();
-        _allItems = [];
-        _visibleItems.Clear();
-        _distribution.Clear();
+        ClearLoadedList();
         _contextOperations.Clear();
         DrawerLayer.Visibility = Visibility.Collapsed;
 
@@ -119,46 +123,51 @@ public partial class VisualResourceWorkspace : UserControl
 
     private async Task LoadSelectedListAsync()
     {
-        if (_client is null || ResourceTabList.SelectedItem is not OfficialApiOperation operation) return;
+        if (_client is not { } client || ResourceTabList.SelectedItem is not OfficialApiOperation operation) return;
+        if (_loadedOperationId != operation.Id) ClearLoadedList();
+        _listCancellation?.Cancel();
+        using var cancellation = new CancellationTokenSource();
+        _listCancellation = cancellation;
         var loadVersion = ++_loadVersion;
         try
         {
             SetLoading(true, $"正在读取{operation.Title.Replace("列出", "", StringComparison.Ordinal)}…");
-            var snapshot = await LoadAllPagesAsync(operation, loadVersion);
+            var snapshot = await LoadAllPagesAsync(client, operation, _moduleId, cancellation.Token);
             if (loadVersion != _loadVersion) return;
             _allItems = snapshot.Items;
-            _selectedItem = null;
-            ResourceGrid.SelectedItem = null;
-            DrawerLayer.Visibility = Visibility.Collapsed;
+            _loadedOperationId = operation.Id;
+            _loadError = null;
+            ClearSelectedResource();
             UpdateSnapshot(snapshot);
             ApplyFilter();
+            UpdateActionState();
             StatusChanged?.Invoke(this, $"已读取 {snapshot.Items.Count} 条{operation.Title.Replace("列出", "", StringComparison.Ordinal)}。" );
         }
         catch (Exception ex)
         {
             if (loadVersion != _loadVersion) return;
-            _allItems = [];
-            _visibleItems.Clear();
-            UpdateSnapshot(new OfficialResourceSnapshot());
-            EmptyTitleText.Text = "资源读取失败";
-            EmptyDescriptionText.Text = ex.Message;
-            EmptyState.Visibility = Visibility.Visible;
+            _loadError = ex.Message;
+            ClearSelectedResource();
+            ApplyFilter();
+            UpdateActionState();
             StatusChanged?.Invoke(this, $"读取失败：{ex.Message}");
         }
         finally
         {
+            if (ReferenceEquals(_listCancellation, cancellation)) _listCancellation = null;
             if (loadVersion == _loadVersion) SetLoading(false, "");
         }
     }
 
-    private async Task<OfficialResourceSnapshot> LoadAllPagesAsync(OfficialApiOperation operation, int loadVersion)
+    private async Task<OfficialResourceSnapshot> LoadAllPagesAsync(
+        IUniFiClient client, OfficialApiOperation operation, string moduleId, CancellationToken cancellationToken)
     {
-        var basePath = operation.ResolvePath(_client!.SiteId, new Dictionary<string, string>());
+        var basePath = operation.ResolvePath(client.SiteId, new Dictionary<string, string>());
         if (!OfficialResourceInteractionService.SupportsPaging(operation))
         {
             var path = AppendQuery(basePath, operation.DefaultQuery);
-            var response = await _client.ExecuteOfficialApiAsync("GET", path);
-            return OfficialResourcePresentationService.Parse(response, _moduleId);
+            var response = await client.ExecuteOfficialApiAsync("GET", path, cancellationToken: cancellationToken);
+            return OfficialResourcePresentationService.Parse(response, moduleId);
         }
 
         var query = ParseQuery(operation.DefaultQuery);
@@ -169,26 +178,42 @@ public partial class VisualResourceWorkspace : UserControl
             ? Math.Clamp(parsedLimit, 1, 200)
             : 50;
         var pages = new List<OfficialResourceSnapshot>();
-        var loadedResponseItems = 0;
-
-        for (var pageNumber = 0; pageNumber < 500; pageNumber++)
+        var pagination = new UniFiPagination(offset);
+        while (true)
         {
-            var pageQuery = OfficialResourceInteractionService.BuildPageQuery(operation.DefaultQuery, offset, limit);
-            var response = await _client.ExecuteOfficialApiAsync("GET", AppendQuery(basePath, pageQuery));
-            if (loadVersion != _loadVersion) return new OfficialResourceSnapshot();
-            var page = OfficialResourcePresentationService.Parse(response, _moduleId);
+            var pageQuery = OfficialResourceInteractionService.BuildPageQuery(operation.DefaultQuery, pagination.Offset, limit);
+            var response = await client.ExecuteOfficialApiAsync("GET", AppendQuery(basePath, pageQuery), cancellationToken: cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            var (page, responseTotal, responseLimit, responseOffset, signature) =
+                OfficialResourcePresentationService.ParsePage(response, moduleId);
             pages.Add(page);
-            loadedResponseItems += page.Items.Count;
-            if (page.HasReportedTotalCount)
-                LoadingText.Text = $"正在读取{operation.Title.Replace("列出", "", StringComparison.Ordinal)}… {Math.Min(loadedResponseItems, page.TotalCount)} / {page.TotalCount}";
-
-            if (page.Items.Count == 0) break;
-            if (page.HasReportedTotalCount && loadedResponseItems >= page.TotalCount) break;
-            if (!page.HasReportedTotalCount && page.Items.Count < limit) break;
-            offset += page.Items.Count;
+            if (!pagination.Advance(page.Items.Count, responseTotal, responseLimit, responseOffset, signature))
+                break;
+            if (pagination.TotalCount is long total)
+                LoadingText.Text = $"正在读取{operation.Title.Replace("列出", "", StringComparison.Ordinal)}… {pagination.Offset} / {total}";
         }
 
-        return OfficialResourceInteractionService.MergePages(pages);
+        var snapshot = OfficialResourceInteractionService.MergePages(pages);
+        if (snapshot.Items.Count < pagination.Offset - offset)
+            throw new UniFiApiException("UniFi 返回了重复的资源，请刷新后重试。");
+        return snapshot;
+    }
+
+    private void ClearLoadedList()
+    {
+        _allItems = [];
+        _loadedOperationId = null;
+        _loadError = null;
+        ClearSelectedResource();
+        UpdateSnapshot(new OfficialResourceSnapshot());
+        ApplyFilter();
+    }
+
+    private void ClearSelectedResource()
+    {
+        _selectedItem = null;
+        ResourceGrid.SelectedItem = null;
+        DrawerLayer.Visibility = Visibility.Collapsed;
     }
 
     private void UpdateSnapshot(OfficialResourceSnapshot snapshot)
@@ -226,11 +251,12 @@ public partial class VisualResourceWorkspace : UserControl
                 .Any(value => value.Contains(term, StringComparison.CurrentCultureIgnoreCase))).ToList();
         _visibleItems.Clear();
         foreach (var item in matches) _visibleItems.Add(item);
-        ResultCountText.Text = $"显示 {_visibleItems.Count} / {_allItems.Count} 条";
-        EmptyTitleText.Text = string.IsNullOrWhiteSpace(term) ? "暂无资源" : "没有匹配的资源";
-        EmptyDescriptionText.Text = string.IsNullOrWhiteSpace(term)
+        var countText = $"显示 {_visibleItems.Count} / {_allItems.Count} 条";
+        ResultCountText.Text = _loadError is not null && _loadedOperationId is not null ? $"刷新失败 · 上次读取 · {countText}" : countText;
+        EmptyTitleText.Text = _loadError is not null ? "资源读取失败" : string.IsNullOrWhiteSpace(term) ? "暂无资源" : "没有匹配的资源";
+        EmptyDescriptionText.Text = _loadError ?? (string.IsNullOrWhiteSpace(term)
             ? "当前官方接口没有返回资源。"
-            : "请调整搜索条件后重试。";
+            : "请调整搜索条件后重试。");
         EmptyState.Visibility = _visibleItems.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 
@@ -274,7 +300,7 @@ public partial class VisualResourceWorkspace : UserControl
         DrawerActionsList.Visibility = _contextOperations.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
         var hasWrite = itemOperations.Any(operation => operation.IsWrite);
         DrawerCapabilityText.Text = hasWrite
-            ? "写操作使用官方 API，并在执行前要求再次确认。"
+            ? _loadError is not null ? "请刷新资源后再执行写操作。" : "写操作使用官方 API，并在执行前要求再次确认。"
             : "官方 API 对此资源仅提供查询能力。";
         DrawerLayer.Visibility = Visibility.Visible;
         if (isOpening) AnimateDrawerEntrance();
@@ -333,6 +359,12 @@ public partial class VisualResourceWorkspace : UserControl
     private async Task ExecuteOperationAsync(OfficialApiOperation operation, OfficialResourceItem? selectedItem)
     {
         if (_client is null) return;
+        if (operation.IsWrite && _loadError is not null)
+        {
+            MessageBox.Show(Window.GetWindow(this), "请刷新资源后再执行写操作。", operation.Title,
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
         if (operation.Method == "PUT" && selectedItem is not null)
         {
             try
@@ -420,7 +452,7 @@ public partial class VisualResourceWorkspace : UserControl
     private void UpdateActionState()
     {
         var connected = _client is not null;
-        PrimaryActionButton.IsEnabled = connected && _primaryOperation is not null;
+        PrimaryActionButton.IsEnabled = connected && _primaryOperation is not null && (!_primaryOperation.IsWrite || _loadError is null);
         RunOperationButton.IsEnabled = connected && _otherOperations.Count > 0;
     }
 

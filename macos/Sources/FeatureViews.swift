@@ -122,6 +122,7 @@ private struct PreviewCount: View {
 struct PolicyChangeView: View {
     @EnvironmentObject var model: AppModel
     @State private var confirmingExecution = false
+    @State private var confirmingOrdering = false
 
     private var plan: PolicyChangePlan? { model.changePlan }
     private var hasOrdering: Bool {
@@ -141,13 +142,15 @@ struct PolicyChangeView: View {
                 }
                 Spacer()
                 Button("加载 JSON", systemImage: "doc.badge.plus") { model.loadPolicyBaseline() }
+                    .disabled(model.busy)
                 Button("加载上次快照", systemImage: "clock.arrow.circlepath") { model.loadLastBackupAsPlan() }
-                    .disabled(model.lastBackupURL == nil)
+                    .disabled(model.busy || model.lastBackupURL == nil)
                 Toggle("严格同步", isOn: Binding(
                     get: { model.synchronizeDeletes },
                     set: { model.setSynchronizeDeletes($0) }
                 ))
                 .toggleStyle(.switch)
+                .disabled(model.busy || plan == nil)
                 .help("开启后生成删除项，并允许恢复基线中的用户策略排序；删除项仍需手动选择。")
             }
             .padding(20)
@@ -167,6 +170,11 @@ struct PolicyChangeView: View {
                     HStack {
                         VStack(alignment: .leading, spacing: 3) {
                             Text(plan.sourceURL.lastPathComponent).fontWeight(.semibold)
+                            if !model.baselineMatchesCurrentSite {
+                                Label("基线来源：\(plan.bundle.target.isEmpty ? "未知" : plan.bundle.target) · \(plan.bundle.site.isEmpty ? "未知站点" : plan.bundle.site)。将应用到 \(model.targetLabel) · \(model.selectedSite?.displayName ?? "未知站点")。",
+                                      systemImage: "exclamationmark.triangle")
+                                    .font(.caption).foregroundStyle(.orange)
+                            }
                             Text(plan.synchronizeDeletes ? "严格同步已开启；删除项必须手动选择，执行完成后恢复用户策略排序。" : "默认只执行新增和更新，不删除现有策略，也不修改排序。")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
@@ -184,7 +192,7 @@ struct PolicyChangeView: View {
                             ))
                             .labelsHidden()
                             .toggleStyle(.checkbox)
-                            .disabled(!item.action.actionable)
+                            .disabled(model.busy || !item.canExecute)
                         }.width(48)
                         TableColumn("范围") { item in Text(item.scope.label) }.width(75)
                         TableColumn("操作") { item in ChangeActionPill(action: item.action) }.width(78)
@@ -198,14 +206,14 @@ struct PolicyChangeView: View {
                         Text("已选择 \(plan.selectedCount) 项\(plan.selectedDeleteCount > 0 ? "，其中删除 \(plan.selectedDeleteCount) 项" : "")。")
                             .font(.caption).foregroundStyle(.secondary)
                         Spacer()
-                        Button("恢复基线排序") { model.applyLoadedOrdering() }
-                            .disabled(!plan.synchronizeDeletes || !hasOrdering || !model.writeReady)
+                        Button("恢复基线排序") { confirmingOrdering = true }
+                            .disabled(model.busy || !plan.synchronizeDeletes || !hasOrdering || !model.writeReady)
                         Button("执行所选变更") {
-                            if plan.selectedDeleteCount > 0 { confirmingExecution = true }
+                            if plan.selectedDeleteCount > 0 || !model.baselineMatchesCurrentSite { confirmingExecution = true }
                             else { model.executeSelectedPlanChanges() }
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(plan.selectedCount == 0 || !model.writeReady)
+                        .disabled(model.busy || plan.selectedCount == 0 || !model.writeReady)
                     }
                 }
                 .padding(16)
@@ -218,11 +226,17 @@ struct PolicyChangeView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .alert("执行包含删除的变更？", isPresented: $confirmingExecution) {
+        .alert("执行所选变更？", isPresented: $confirmingExecution) {
             Button("取消", role: .cancel) { }
-            Button("确认执行", role: .destructive) { model.executeSelectedPlanChanges() }
+            Button("确认执行", role: (plan?.selectedDeleteCount ?? 0) > 0 ? .destructive : nil) { model.executeSelectedPlanChanges() }
         } message: {
-            Text("已选择 \(plan?.selectedDeleteCount ?? 0) 个删除项。程序会先保存完整实时快照，但删除仍会立即写入 UniFi。")
+            Text("目标为 \(model.targetLabel) · \(model.selectedSite?.displayName ?? "未知站点")，已选中 \(plan?.selectedDeleteCount ?? 0) 个删除项。请核对目标与所选操作。")
+        }
+        .alert("恢复基线排序？", isPresented: $confirmingOrdering) {
+            Button("取消", role: .cancel) { }
+            Button("确认恢复") { model.applyLoadedOrdering() }
+        } message: {
+            Text("此操作会修改 \(model.targetLabel) · \(model.selectedSite?.displayName ?? "未知站点") 的用户策略排序。")
         }
     }
 }

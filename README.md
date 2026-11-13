@@ -1,4 +1,11 @@
-# UniFi Policy Manager
+# UniFi Network Manager
+
+![UniFi Network Manager 项目封面](docs/cover.jpg)
+
+**在 Windows 和 macOS 上管理 UniFi Network 策略。** 导入或导出 DNS、ACL 和防火墙基线，预览变更差异，并在写入前保存快照。
+
+[下载最新版本](https://github.com/autunn/unifi-policy-manager/releases/latest) · [macOS 使用说明](macos/README.md) · [报告问题](https://github.com/autunn/unifi-policy-manager/issues)
+
 
 [![Build](https://github.com/autunn/unifi-policy-manager/actions/workflows/build.yml/badge.svg)](https://github.com/autunn/unifi-policy-manager/actions/workflows/build.yml)
 [![Release](https://img.shields.io/github/v/release/autunn/unifi-policy-manager)](https://github.com/autunn/unifi-policy-manager/releases/latest)
@@ -58,10 +65,10 @@ Windows 与 macOS 的普通资源模块不再显示路径和 JSON：列表接口
 
 ### Windows
 
-双击：
+从 Releases 下载并解压 Windows 版，双击压缩包内的 EXE。较早版本的文件名为 UniFi-Policy-Manager.exe。源码构建的可执行文件位于：
 
 ```text
-publish-4.1.1\UniFi-Policy-Manager.exe
+publish-4.1.1\UniFi-Network-Manager.exe
 ```
 
 ### macOS
@@ -70,10 +77,10 @@ macOS 14 或更高版本可从源码构建原生 SwiftUI 应用：
 
 ```bash
 ./macos/build-app.sh
-open macos/dist/UniFi-Policy-Manager.app
+open macos/dist/UniFi-Network-Manager.app
 ```
 
-macOS 端使用系统钥匙串保存 API Key，并在写入前将完整基线保存到
+macOS 端使用系统钥匙串保存 API Key，并在专用策略操作写入前将基线保存到
 `~/Library/Application Support/UniFiPolicyManager/backups`。macOS 已包含策略变更中心、
 212 条内置规则、TXT/CSV/XLSX 批量导入、批量删除和策略排序。完整说明见 [`macos/README.md`](macos/README.md)。
 
@@ -100,9 +107,9 @@ macOS 端使用系统钥匙串保存 API Key，并在写入前将完整基线保
 %LOCALAPPDATA%\UniFiPolicyManager\backups
 ```
 
-执行一次变更计划后，可以点击“载入上次快照”生成恢复计划。恢复仍需预览和确认，不会绕过安全检查。
+执行一次变更计划后，可以点击“载入上次快照”生成当前 Console 和站点的恢复计划。写入前会重新读取策略。如果状态已变化，程序会刷新预览，请重新选择。
 
-跨站点导入会按策略 ID 或名称匹配；网络和防火墙区域 UUID 必须在目标站点有效。
+跨站点导入时，DNS 按记录特征匹配，ACL 与防火墙按策略名称匹配。网络和防火墙区域 UUID 必须在目标站点有效。
 
 ## ACL 与防火墙编辑
 
@@ -135,7 +142,7 @@ EXE 内部直接封装了 212 条按服务分类的转发域规则，不依赖�
 
 - API Key 使用 Windows DPAPI 当前用户加密，设置文件中不保存明文
 - API Key 不写入策略基线、快照或操作日志
-- DNS、ACL、防火墙专用页面修改前自动备份完整策略基线
+- Windows 的 DNS 专用操作保存 DNS 快照，ACL、防火墙与策略变更计划保存策略基线。通用资源和官方端点的写入会显示确认提示。这些操作不生成完整策略基线。
 - 通用官方 API 工作台写操作显示最终路径与请求体并二次确认；审计日志只记录 operation ID 和方法，不记录请求体或查询值
 - Windows 操作日志位于 `%LOCALAPPDATA%\UniFiPolicyManager\logs\operations.ndjson`
 - 系统/派生策略保持只读
@@ -155,8 +162,8 @@ EXE 内部直接封装了 212 条按服务分类的转发域规则，不依赖�
 3. 根据需要选择是否标记为预发布；如果只想下载 Actions Artifacts、不创建 Release，可关闭“创建 GitHub Release”。
 4. 工作流会并行构建 Windows 与 macOS；Windows 还会运行完整自测。
 5. 两端全部成功后，自动创建 `v版本号` 的 GitHub Release，并同时上传：
-   - `UniFi-Policy-Manager-版本号-win-x64.zip`
-   - `UniFi-Policy-Manager-版本号-macOS.zip`
+   - `UniFi-Network-Manager-版本号-win-x64.zip`
+   - `UniFi-Network-Manager-版本号-macOS.zip`
    - `SHA256SUMS.txt`
 
 任一平台构建或自测失败时不会创建 Release。
@@ -165,12 +172,14 @@ EXE 内部直接封装了 212 条按服务分类的转发域规则，不依赖�
 
 ## 演示与自测
 
+Windows 和 macOS 登录页均提供离线演示。Windows 也支持命令行启动：
+
 ```powershell
-.\publish-4.1.1\UniFi-Policy-Manager.exe --demo
+.\publish-4.1.1\UniFi-Network-Manager.exe --demo
 ```
 
 ```powershell
-Start-Process .\publish-4.1.1\UniFi-Policy-Manager.exe -ArgumentList '--self-test','--self-test-output=self-test.json' -Wait
+Start-Process .\publish-4.1.1\UniFi-Network-Manager.exe -ArgumentList '--self-test','--self-test-output=self-test.json' -Wait
 ```
 
 ## 构建
@@ -184,8 +193,8 @@ Start-Process .\publish-4.1.1\UniFi-Policy-Manager.exe -ArgumentList '--self-tes
 输出：
 
 ```text
-publish-4.1.1\UniFi-Policy-Manager.exe
-UniFi-Policy-Manager-4.1.1-win-x64.zip
+publish-4.1.1\UniFi-Network-Manager.exe
+UniFi-Network-Manager-4.1.1-win-x64.zip
 ```
 
 也可以直接使用标准 .NET 命令：
@@ -195,7 +204,7 @@ dotnet restore .\UniFiDnsManager.csproj
 dotnet build .\UniFiDnsManager.csproj -c Release --no-restore
 ```
 
-仓库内置 GitHub Actions 工作流。每次推送或 Pull Request 都会在 Windows 环境构建项目，并生成自包含的 `win-x64` EXE 构建产物。
+Windows CI 构建自包含的 win-x64 EXE，并运行内置自测。macOS CI 运行 Swift 测试并生成应用包。
 
 ## 仓库安全
 

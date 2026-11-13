@@ -146,6 +146,7 @@ final class AppModel: ObservableObject {
     private var api: UniFiAPI?
     private var loadedBundle: PolicyBundle?
     private var loadedBundleURL: URL?
+    private var planPreviewState: CorePolicyState?
     private var aclOrdering: PolicyOrderingSnapshot?
     private var firewallOrdering: PolicyOrderingSnapshot?
 
@@ -160,6 +161,10 @@ final class AppModel: ObservableObject {
     var targetLabel: String { demoMode ? "演示环境" : (api?.target ?? host) }
     var versionLabel: String { demoMode ? "Demo 10.4.57" : (api?.applicationVersion ?? "未知") }
     var totalCount: Int { dnsRecords.count + aclRules.count + firewallRules.count }
+    var baselineMatchesCurrentSite: Bool {
+        guard let loadedBundle, let selectedSite else { return false }
+        return loadedBundle.matchesSite(target: targetLabel, siteID: selectedSite.id)
+    }
 
     var filteredDNS: [DNSRecord] {
         dnsRecords.filter { record in
@@ -218,6 +223,7 @@ final class AppModel: ObservableObject {
         } catch { errorMessage = error.localizedDescription }
         connected = true
         demoMode = false
+        lastBackupURL = BackupService.latestSnapshot(target: targetLabel, siteID: site.id, demo: false)
         writeReady = false
         selectedPage = .overview
         await refreshAllBody()
@@ -225,9 +231,13 @@ final class AppModel: ObservableObject {
     }
 
     func startDemo() {
+        guard !busy else { return }
         demoMode = true
         connected = true
         selectedSite = UniFiSite(id: "cf95a3c0-21f4-48a8-a028-6ad714b9689e", internalReference: "default", name: "家庭网络")
+        if let selectedSite {
+            lastBackupURL = BackupService.latestSnapshot(target: targetLabel, siteID: selectedSite.id, demo: true)
+        }
         dnsRecords = DemoData.dns
         aclRules = DemoData.acl
         firewallRules = DemoData.firewall
@@ -241,6 +251,7 @@ final class AppModel: ObservableObject {
     }
 
     func disconnect() {
+        guard !busy else { return }
         api = nil
         connected = false
         demoMode = false
@@ -254,6 +265,9 @@ final class AppModel: ObservableObject {
         loadedBundle = nil
         loadedBundleURL = nil
         changePlan = nil
+        planPreviewState = nil
+        lastBackupURL = nil
+        synchronizeDeletes = false
         dnsBatchPreview = nil
         writeReady = false
         search = ""
@@ -306,7 +320,7 @@ final class AppModel: ObservableObject {
                         requestJSON: body
                     )
                 }
-                if operation.isWrite { BackupService.log("official api \(operation.method) \(operation.id)") }
+                if operation.isWrite { self.log("official api \(operation.method) \(operation.id)") }
                 self.status = "\(operation.title)执行成功"
             }
         }
@@ -343,12 +357,13 @@ final class AppModel: ObservableObject {
                 requestJSON: body
             )
         }
-        if operation.isWrite { BackupService.log("official visual action \(operation.method) \(operation.id)") }
+        if operation.isWrite { log("official visual action \(operation.method) \(operation.id)") }
+        else { try Task.checkCancellation() }
         status = "\(operation.title)执行成功"
         return response
     }
 
-    private func refreshAllBody() async {
+    private func refreshAllBody(rebuildPlan: Bool = true) async {
         guard !demoMode else { writeReady = true; status = "演示数据已刷新"; return }
         guard let api else { writeReady = false; status = "尚未连接 UniFi Console"; return }
         do {
@@ -356,7 +371,7 @@ final class AppModel: ObservableObject {
             apply(core)
             references = await api.listReferences()
             writeReady = true
-            if loadedBundle != nil { rebuildChangePlan() }
+            if rebuildPlan, loadedBundle != nil { rebuildChangePlan() }
             status = "已读取 DNS \(dnsRecords.count) 条、ACL \(aclRules.count) 条、防火墙 \(firewallRules.count) 条"
         } catch {
             writeReady = false
@@ -377,7 +392,7 @@ final class AppModel: ObservableObject {
                     if record.id == nil { _ = try await api.createDNS(record) } else { _ = try await api.updateDNS(record) }
                     await self.refreshAllBody()
                 }
-                BackupService.log(record.id == nil ? "create dns \(record.key)" : "update dns \(record.key)")
+                self.log(record.id == nil ? "create dns \(record.key)" : "update dns \(record.key)")
                 self.status = record.id == nil ? "DNS 记录已新增" : "DNS 记录已更新"
             }
         }
@@ -389,7 +404,7 @@ final class AppModel: ObservableObject {
                 try await self.backup(reason: "before-delete-dns")
                 if self.demoMode { self.dnsRecords.removeAll { $0.stableID == record.stableID } }
                 else if let api = self.api { try await api.deleteDNS(record); await self.refreshAllBody() }
-                BackupService.log("delete dns \(record.key)")
+                self.log("delete dns \(record.key)")
                 self.status = "DNS 记录已删除"
             }
         }
@@ -465,7 +480,7 @@ final class AppModel: ObservableObject {
                     } catch { failures.append("\(DNSImportService.describe(source))：\(error.localizedDescription)") }
                 }
                 if !self.demoMode { await self.refreshAllBody() }
-                BackupService.log("batch create dns \(created), failed \(failures.count)")
+                self.log("batch create dns \(created), failed \(failures.count)")
                 self.status = "批量新增完成：成功 \(created) 条，失败 \(failures.count) 条"
                 if !failures.isEmpty { self.errorMessage = "部分规则新增失败：\n" + failures.prefix(20).joined(separator: "\n") }
             }
@@ -488,7 +503,7 @@ final class AppModel: ObservableObject {
                     } catch { failures.append("\(record.key)：\(error.localizedDescription)") }
                 }
                 if !self.demoMode { await self.refreshAllBody() }
-                BackupService.log("batch delete forward domains \(deleted), failed \(failures.count)")
+                self.log("batch delete forward domains \(deleted), failed \(failures.count)")
                 self.status = "批量删除完成：成功 \(deleted) 条，失败 \(failures.count) 条"
                 if !failures.isEmpty { self.errorMessage = "部分转发域删除失败：\n" + failures.prefix(20).joined(separator: "\n") }
             }
@@ -520,7 +535,7 @@ final class AppModel: ObservableObject {
                     if let existing { _ = try await api.updatePolicy(existing, json: json) } else { _ = try await api.createPolicy(kind, json: json) }
                     await self.refreshAllBody()
                 }
-                BackupService.log("save \(kind.rawValue) policy")
+                self.log("save \(kind.rawValue) policy")
                 self.status = existing == nil ? "策略已新增" : "策略已更新"
             }
         }
@@ -533,7 +548,7 @@ final class AppModel: ObservableObject {
                 if self.demoMode {
                     if rule.kind == .acl { self.aclRules.removeAll { $0.id == rule.id } } else { self.firewallRules.removeAll { $0.id == rule.id } }
                 } else if let api = self.api { try await api.deletePolicy(rule); await self.refreshAllBody() }
-                BackupService.log("delete \(rule.kind.rawValue) policy \(rule.name)")
+                self.log("delete \(rule.kind.rawValue) policy \(rule.name)")
                 self.status = "策略已删除"
             }
         }
@@ -562,36 +577,46 @@ final class AppModel: ObservableObject {
                     try await api.movePolicy(rule, direction: direction)
                     await self.refreshAllBody()
                 }
-                BackupService.log("move \(rule.kind.rawValue) policy \(rule.name) \(direction)")
+                self.log("move \(rule.kind.rawValue) policy \(rule.name) \(direction)")
                 self.status = direction < 0 ? "策略已上移" : "策略已下移"
             }
         }
     }
 
     func exportBaseline() {
+        guard connected, !busy else { return }
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.json]
         panel.nameFieldStringValue = "unifi-policy-baseline-\(dateStamp()).json"
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            try BackupService.encoder.encode(bundle()).write(to: url, options: .atomic)
-            status = "基线已导出到 \(url.lastPathComponent)"
-        } catch { errorMessage = error.localizedDescription }
+        Task {
+            await perform("正在读取当前站点以导出基线…") {
+                let core: CorePolicyState? = self.demoMode ? nil : try await self.fetchCorePolicies()
+                try PolicyBundleCodec.save(self.bundle(core: core), to: url)
+                self.status = "基线已导出到 \(url.lastPathComponent)"
+            }
+        }
     }
 
     func revealBackups() {
-        try? FileManager.default.createDirectory(at: BackupService.root.appendingPathComponent("backups"), withIntermediateDirectories: true)
-        NSWorkspace.shared.activateFileViewerSelecting([BackupService.root.appendingPathComponent("backups")])
+        let directory = BackupService.backupDirectory(demo: demoMode)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            NSWorkspace.shared.activateFileViewerSelecting([directory])
+        } catch { errorMessage = error.localizedDescription }
     }
 
     func loadPolicyBaseline() {
+        guard !busy else { return }
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.json]
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
-            loadedBundle = try PolicyBundleCodec.load(url)
+            let bundle = try PolicyBundleCodec.load(url)
+            loadedBundle = bundle
             loadedBundleURL = url
+            synchronizeDeletes = false
             rebuildChangePlan()
             selectedPage = .changes
             status = "已加载策略基线 \(url.lastPathComponent)"
@@ -599,9 +624,14 @@ final class AppModel: ObservableObject {
     }
 
     func loadLastBackupAsPlan() {
-        guard let url = lastBackupURL else { errorMessage = "当前会话还没有写入前快照。"; return }
+        guard !busy else { return }
+        guard let url = lastBackupURL, let site = selectedSite else { errorMessage = "当前站点还没有写入前快照。"; return }
         do {
-            loadedBundle = try PolicyBundleCodec.load(url)
+            let bundle = try PolicyBundleCodec.load(url)
+            guard bundle.matchesSite(target: targetLabel, siteID: site.id) else {
+                throw UniFiError.api("快照中的 Console 或站点与当前连接不匹配。")
+            }
+            loadedBundle = bundle
             loadedBundleURL = url
             synchronizeDeletes = true
             rebuildChangePlan()
@@ -611,20 +641,31 @@ final class AppModel: ObservableObject {
     }
 
     func setSynchronizeDeletes(_ enabled: Bool) {
+        guard !busy else { return }
         synchronizeDeletes = enabled
         rebuildChangePlan()
     }
 
-    func rebuildChangePlan() {
-        guard let bundle = loadedBundle, let url = loadedBundleURL else { changePlan = nil; return }
-        changePlan = PolicyChangeService.buildPlan(
+    func rebuildChangePlan(clearSelection: Bool = false) {
+        guard let bundle = loadedBundle, let url = loadedBundleURL else {
+            changePlan = nil
+            planPreviewState = nil
+            return
+        }
+        var plan = PolicyChangeService.buildPlan(
             bundle: bundle, sourceURL: url, currentDNS: dnsRecords, currentACL: aclRules,
-            currentFirewall: firewallRules, synchronizeDeletes: synchronizeDeletes
+            currentFirewall: firewallRules, synchronizeDeletes: synchronizeDeletes,
+            matchSourceIDs: baselineMatchesCurrentSite
         )
+        if clearSelection {
+            for index in plan.items.indices { plan.items[index].isSelected = false }
+        }
+        changePlan = plan
+        planPreviewState = currentCorePolicies()
     }
 
     func togglePlanItem(_ id: UUID, selected: Bool) {
-        guard var plan = changePlan, let index = plan.items.firstIndex(where: { $0.id == id }), plan.items[index].action.actionable else { return }
+        guard !busy, var plan = changePlan, let index = plan.items.firstIndex(where: { $0.id == id }), plan.items[index].canExecute else { return }
         plan.items[index].isSelected = selected
         changePlan = plan
     }
@@ -634,8 +675,10 @@ final class AppModel: ObservableObject {
     func clearPlanSelection() { selectPlanItems { _ in false } }
 
     private func selectPlanItems(_ predicate: (PolicyChangeItem) -> Bool) {
-        guard var plan = changePlan else { return }
-        for index in plan.items.indices { plan.items[index].isSelected = predicate(plan.items[index]) }
+        guard !busy, var plan = changePlan else { return }
+        for index in plan.items.indices {
+            plan.items[index].isSelected = plan.items[index].canExecute && predicate(plan.items[index])
+        }
         changePlan = plan
     }
 
@@ -643,27 +686,35 @@ final class AppModel: ObservableObject {
         Task {
             await perform("正在执行策略变更计划…") {
                 guard var plan = self.changePlan else { throw UniFiError.api("请先加载策略基线。") }
-                let selected = plan.items.indices.filter { plan.items[$0].isSelected && plan.items[$0].action.actionable }
+                let selected = plan.items.indices.filter { plan.items[$0].isSelected && plan.items[$0].canExecute }
                 guard !selected.isEmpty else { throw UniFiError.api("请至少选择一项可执行变更。") }
-                try await self.backup(reason: "before-change-plan")
+                try await self.backup(reason: "before-change-plan", preview: plan)
                 var failures: [String] = []
                 for index in selected.sorted(by: { self.changeExecutionOrder(plan.items[$0]) < self.changeExecutionOrder(plan.items[$1]) }) {
                     do {
                         try await self.executePlanItem(&plan.items[index])
                         plan.items[index].status = "已完成"
+                        plan.items[index].applied = true
+                        plan.items[index].isSelected = false
                     } catch {
                         plan.items[index].status = "失败：\(error.localizedDescription)"
                         failures.append("\(plan.items[index].scope.label) / \(plan.items[index].name)：\(error.localizedDescription)")
                     }
                     self.changePlan = plan
                 }
-                if !self.demoMode { await self.refreshAllBody() }
+                if !self.demoMode { await self.refreshAllBody(rebuildPlan: false) }
                 self.resolveActualIDs(&plan)
-                if failures.isEmpty && plan.synchronizeDeletes { try await self.restoreOrdering(for: &plan) }
+                var orderingFailure: String?
+                if failures.isEmpty && plan.synchronizeDeletes && self.writeReady {
+                    do { try await self.restoreOrdering(for: &plan) }
+                    catch { orderingFailure = error.localizedDescription }
+                }
                 self.changePlan = plan
-                BackupService.log("execute change plan selected \(selected.count), failed \(failures.count)")
-                self.status = "变更计划完成：成功 \(selected.count - failures.count) 项，失败 \(failures.count) 项"
+                self.log("execute change plan selected \(selected.count), failed \(failures.count)")
+                let refreshStatus = self.writeReady ? "" : "。刷新未完成，请重新读取当前站点策略。"
+                self.status = "变更计划完成：成功 \(selected.count - failures.count) 项，失败 \(failures.count) 项\(refreshStatus)"
                 if !failures.isEmpty { self.errorMessage = "部分变更失败：\n" + failures.prefix(20).joined(separator: "\n") }
+                if let orderingFailure { self.errorMessage = "策略已写入，但排序恢复失败：\n" + orderingFailure }
             }
         }
     }
@@ -672,7 +723,7 @@ final class AppModel: ObservableObject {
         Task {
             await perform("正在恢复基线策略排序…") {
                 guard var plan = self.changePlan, plan.synchronizeDeletes else { throw UniFiError.api("请先加载基线并开启严格同步。") }
-                try await self.backup(reason: "before-order-restore")
+                try await self.backup(reason: "before-order-restore", preview: plan)
                 self.resolveActualIDs(&plan)
                 try await self.restoreOrdering(for: &plan)
                 self.changePlan = plan
@@ -786,9 +837,13 @@ final class AppModel: ObservableObject {
                     plan.items[index].actualID = dnsRecords.first(where: { DNSImportService.identity($0) == DNSImportService.identity(desired) })?.id
                 }
             case .acl:
-                plan.items[index].actualID = aclRules.first(where: { $0.name.caseInsensitiveCompare(plan.items[index].name) == .orderedSame })?.id
+                plan.items[index].actualID = aclRules.first(where: {
+                    $0.canModify && $0.name.caseInsensitiveCompare(plan.items[index].name) == .orderedSame
+                })?.id
             case .firewall:
-                plan.items[index].actualID = firewallRules.first(where: { $0.name.caseInsensitiveCompare(plan.items[index].name) == .orderedSame })?.id
+                plan.items[index].actualID = firewallRules.first(where: {
+                    $0.canModify && $0.name.caseInsensitiveCompare(plan.items[index].name) == .orderedSame
+                })?.id
             }
         }
     }
@@ -829,33 +884,67 @@ final class AppModel: ObservableObject {
         if batchDNSServer.isEmpty, let server = core.dns.first(where: \.isForwardDomain)?.value { batchDNSServer = server }
     }
 
-    private func backup(reason: String) async throws {
-        if demoMode {
-            lastBackupURL = try BackupService.saveSnapshot(reason: reason, bundle: bundle())
-            return
+    private func currentCorePolicies() -> CorePolicyState {
+        CorePolicyState(
+            dns: dnsRecords, acl: aclRules, firewall: firewallRules,
+            aclOrdering: aclOrdering, firewallOrdering: firewallOrdering
+        )
+    }
+
+    private func requireCurrentPlan(_ plan: PolicyChangePlan) throws {
+        let current = currentCorePolicies()
+        let needsACLOrdering = plan.synchronizeDeletes && plan.bundle.aclOrdering?.orderedACLRuleIDs.isEmpty == false
+        let firewallOrder = plan.bundle.firewallOrdering
+        let needsFirewallOrdering = plan.synchronizeDeletes
+            && (firewallOrder?.beforeSystemDefined.isEmpty == false || firewallOrder?.afterSystemDefined.isEmpty == false)
+        guard (!needsACLOrdering || current.aclOrdering != nil),
+              (!needsFirewallOrdering || current.firewallOrdering != nil) else {
+            throw UniFiError.api("无法读取待恢复范围的当前排序。请刷新当前站点并检查排序读取权限。")
         }
+        guard let preview = planPreviewState, PolicyChangeService.matchesPreview(
+            plan: plan, previousDNS: preview.dns, currentDNS: current.dns,
+            previousACL: preview.acl, currentACL: current.acl, previousFirewall: preview.firewall,
+            currentFirewall: current.firewall
+        ),
+        (!needsACLOrdering || preview.aclOrdering == current.aclOrdering),
+        (!needsFirewallOrdering || preview.firewallOrdering == current.firewallOrdering) else {
+            rebuildChangePlan(clearSelection: true)
+            throw UniFiError.api("当前站点策略在预览后已变化。请检查重新生成的计划并重新选择变更。")
+        }
+    }
+
+    private func backup(reason: String, preview: PolicyChangePlan? = nil) async throws {
+        if !demoMode {
+            do {
+                apply(try await fetchCorePolicies())
+                writeReady = true
+            } catch {
+                writeReady = false
+                throw UniFiError.api("无法读取 DNS、ACL 和防火墙的完整实时基线，写入已取消：\(error.localizedDescription)")
+            }
+        }
+        if let preview { try requireCurrentPlan(preview) }
         do {
-            let core = try await fetchCorePolicies()
-            apply(core)
-            writeReady = true
-            lastBackupURL = try BackupService.saveSnapshot(reason: reason, bundle: bundle(core: core))
+            lastBackupURL = try BackupService.saveSnapshot(reason: reason, bundle: bundle(), demo: demoMode)
         } catch {
             writeReady = false
-            throw UniFiError.api("无法读取 DNS、ACL 和防火墙的完整实时基线，写入已取消：\(error.localizedDescription)")
+            throw UniFiError.api("无法保存写入前快照，写入已取消：\(error.localizedDescription)")
         }
     }
 
     private func bundle(core: CorePolicyState? = nil) -> PolicyBundle {
-        let currentDNS = core?.dns ?? dnsRecords
-        let currentACL = core?.acl ?? aclRules
-        let currentFirewall = core?.firewall ?? firewallRules
+        let state = core ?? currentCorePolicies()
         return PolicyBundle(
             schemaVersion: 2, createdAt: Date(), target: targetLabel, site: selectedSite?.displayName ?? "",
-            siteID: selectedSite?.id ?? "", networkVersion: versionLabel, dnsRecords: currentDNS,
-            aclRules: currentACL.map(jsonValue), firewallPolicies: currentFirewall.map(jsonValue),
-            aclOrdering: core?.aclOrdering ?? aclOrdering,
-            firewallOrdering: core?.firewallOrdering ?? firewallOrdering
+            siteID: selectedSite?.id ?? "", networkVersion: versionLabel, dnsRecords: state.dns,
+            aclRules: state.acl.map(jsonValue), firewallPolicies: state.firewall.map(jsonValue),
+            aclOrdering: state.aclOrdering,
+            firewallOrdering: state.firewallOrdering
         )
+    }
+
+    private func log(_ message: String) {
+        BackupService.log(message, demo: demoMode)
     }
 
     private func jsonValue(_ rule: PolicyRule) -> JSONValue {

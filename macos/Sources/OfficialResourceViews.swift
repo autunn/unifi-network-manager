@@ -47,11 +47,33 @@ struct OfficialResourceSnapshot {
 enum OfficialResourcePresenter {
     static func parse(_ json: String, moduleID: String) throws -> OfficialResourceSnapshot {
         let object = try JSONSerialization.jsonObject(with: Data(json.utf8), options: [.fragmentsAllowed])
-        let dictionaries = extractDictionaries(object)
-        let items = dictionaries.map { makeItem($0, moduleID: moduleID) }
+        return parseItems(extractDictionaries(object) ?? (object as? [String: Any]).map { [$0] } ?? [],
+                          root: object as? [String: Any], moduleID: moduleID)
+    }
+
+    static func parsePage(_ json: String, moduleID: String) throws -> (
+        snapshot: OfficialResourceSnapshot, total: Int?, limit: Int?, offset: Int?, signature: Data
+    ) {
+        let object = try JSONSerialization.jsonObject(with: Data(json.utf8), options: [.fragmentsAllowed])
+        if let data = (object as? [String: Any])?["data"], !(data is [[String: Any]]) {
+            throw UniFiError.invalidResponse("UniFi 列表响应格式不正确。")
+        }
+        guard let dictionaries = extractDictionaries(object) else {
+            throw UniFiError.invalidResponse("UniFi 列表响应格式不正确。")
+        }
         let root = object as? [String: Any]
-        let reportedTotal = (root?["totalCount"] as? NSNumber)?.intValue
-            ?? (root?["count"] as? NSNumber)?.intValue
+        return (
+            parseItems(dictionaries, root: root, moduleID: moduleID),
+            UniFiPagination.nonNegativeInt(root?["totalCount"]),
+            UniFiPagination.nonNegativeInt(root?["limit"]),
+            UniFiPagination.nonNegativeInt(root?["offset"]),
+            try UniFiPagination.pageSignature(dictionaries)
+        )
+    }
+
+    private static func parseItems(_ dictionaries: [[String: Any]], root: [String: Any]?, moduleID: String) -> OfficialResourceSnapshot {
+        let items = dictionaries.map { makeItem($0, moduleID: moduleID) }
+        let reportedTotal = UniFiPagination.nonNegativeInt(root?["totalCount"])
         return snapshot(items: items, totalCount: max(reportedTotal ?? items.count, items.count), hasReportedTotalCount: reportedTotal != nil)
     }
 
@@ -81,14 +103,14 @@ enum OfficialResourcePresenter {
         )
     }
 
-    private static func extractDictionaries(_ object: Any) -> [[String: Any]] {
+    private static func extractDictionaries(_ object: Any) -> [[String: Any]]? {
         if let array = object as? [[String: Any]] { return array }
-        guard let dictionary = object as? [String: Any] else { return [] }
+        guard let dictionary = object as? [String: Any] else { return nil }
         for key in ["data", "items", "results", "devices", "clients", "networks", "broadcasts", "vouchers", "policies", "zones"] {
             if let array = dictionary[key] as? [[String: Any]] { return array }
         }
         if let array = dictionary.values.compactMap({ $0 as? [[String: Any]] }).first { return array }
-        return [dictionary]
+        return nil
     }
 
     private static func makeItem(_ dictionary: [String: Any], moduleID: String) -> OfficialResourceItem {
@@ -380,6 +402,11 @@ struct VisualResourceWorkspaceView: View {
     @State private var operationItem: OfficialResourceItem?
     @State private var loading = false
     @State private var loadToken = UUID()
+    @State private var listTask: Task<Void, Never>?
+    @State private var loadedListID: String?
+    @State private var loadError: String?
+
+    private var resourceWriteReady: Bool { model.writeReady && loadError == nil }
 
     private var module: OfficialAPIModule? { OfficialAPICatalog.module(moduleID) }
     private var operations: [OfficialAPIOperation] { OfficialAPICatalog.operations(for: moduleID) }
@@ -441,7 +468,9 @@ struct VisualResourceWorkspaceView: View {
 
             VStack(spacing: 12) {
                 HStack(spacing: 10) {
-                    ResourceMetricCard(title: "资源总数", value: "\(snapshot.totalCount)", note: "已完整读取当前分类", symbol: moduleSymbol, tint: .blue)
+                    ResourceMetricCard(title: "资源总数", value: loadedListID == nil ? "—" : "\(snapshot.totalCount)",
+                                       note: loadError == nil ? "当前分类" : loadedListID == nil ? "读取失败" : "上次读取",
+                                       symbol: moduleSymbol, tint: .blue)
                     ResourceMetricCard(title: "正常 / 可用", value: snapshot.hasHealthData ? "\(snapshot.healthyCount)" : "—", note: availabilityText, symbol: "checkmark.circle", tint: .green)
                     ResourceMetricCard(title: "需要关注", value: snapshot.hasHealthData ? "\(snapshot.attentionCount)" : "—", note: snapshot.hasHealthData ? "离线、停用或待处理" : "接口未返回状态", symbol: "exclamationmark.triangle", tint: .orange)
                     ResourceMetricCard(title: "资源类型", value: "\(snapshot.distributions.count)", note: "来自实时返回数据", symbol: "square.grid.2x2", tint: .purple)
@@ -473,7 +502,7 @@ struct VisualResourceWorkspaceView: View {
         }
         .animation(.easeOut(duration: 0.15), value: loading)
         .inspector(isPresented: Binding(get: { inspectorItem != nil }, set: { if !$0 { inspectorItem = nil; selectedItemID = nil } })) {
-            if let inspectorItem { ResourceInspector(item: inspectorItem, operations: itemOperations, writeReady: model.writeReady) { operation in prepare(operation, item: inspectorItem) } }
+            if let inspectorItem { ResourceInspector(item: inspectorItem, operations: itemOperations, writeReady: resourceWriteReady) { operation in prepare(operation, item: inspectorItem) } }
         }
         .sheet(item: $operationSheet) { operation in
             OfficialOperationFormView(operation: operation, selectedItem: operationItem) { parameters, query, body in
@@ -482,6 +511,7 @@ struct VisualResourceWorkspaceView: View {
         }
         .onAppear { resetModule() }
         .onChange(of: moduleID) { _, _ in resetModule() }
+        .onDisappear { listTask?.cancel() }
         .onChange(of: selectedItemID) { _, id in
             inspectorItem = snapshot.items.first { $0.id == id }
         }
@@ -504,14 +534,14 @@ struct VisualResourceWorkspaceView: View {
             if let primaryOperation {
                 Button(primaryOperation.title, systemImage: "plus") { prepare(primaryOperation, item: nil) }
                     .buttonStyle(.borderedProminent)
-                    .disabled(primaryOperation.isWrite && !model.writeReady)
+                    .disabled(primaryOperation.isWrite && !resourceWriteReady)
                     .pointingHandOnHover()
             }
             if !otherOperations.isEmpty {
                 Menu("更多操作", systemImage: "ellipsis.circle") {
                     ForEach(otherOperations) { operation in
                         Button(operation.title) { prepare(operation, item: nil) }
-                            .disabled(operation.isWrite && !model.writeReady)
+                            .disabled(operation.isWrite && !resourceWriteReady)
                     }
                 }
                 .pointingHandOnHover()
@@ -522,6 +552,14 @@ struct VisualResourceWorkspaceView: View {
 
     private var resourceTable: some View {
         VStack(spacing: 0) {
+            if let loadError, loadedListID != nil {
+                Label("刷新失败，显示上次读取结果。\(loadError)", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 11)
+                    .padding(.top, 8)
+            }
             HStack {
                 TextField("搜索名称、状态、类型、地址或 ID", text: $search)
                     .textFieldStyle(.roundedBorder).frame(maxWidth: 340)
@@ -547,7 +585,9 @@ struct VisualResourceWorkspaceView: View {
                 TableColumn("说明", value: \.detail).width(min: 130, ideal: 180)
             }
             .overlay {
-                if filteredItems.isEmpty {
+                if let loadError, filteredItems.isEmpty {
+                    ContentUnavailableView("资源读取失败", systemImage: "exclamationmark.triangle", description: Text(loadError))
+                } else if filteredItems.isEmpty, loadedListID != nil {
                     ContentUnavailableView(search.isEmpty ? "暂无资源" : "没有匹配的资源", systemImage: moduleSymbol, description: Text(search.isEmpty ? "当前官方接口没有返回资源。" : "请调整搜索条件后重试。"))
                 }
             }
@@ -578,60 +618,83 @@ struct VisualResourceWorkspaceView: View {
     }
 
     private func resetModule() {
+        listTask?.cancel()
         selectedListID = listOperations.first?.id ?? ""
         search = ""
-        snapshot = .empty
-        selectedItemID = nil
-        inspectorItem = nil
+        clearLoadedList()
         loadToken = UUID()
         loadList()
     }
 
+    private func clearLoadedList() {
+        snapshot = .empty
+        loadedListID = nil
+        loadError = nil
+        selectedItemID = nil
+        inspectorItem = nil
+    }
+
     private func loadList() {
+        listTask?.cancel()
         guard let operation = selectedOperation else { return }
+        if loadedListID != operation.id { clearLoadedList() }
         let token = UUID()
         loadToken = token
-        Task { @MainActor in
+        listTask = Task { @MainActor in
+            guard !Task.isCancelled else { return }
             loading = true
             defer { if loadToken == token { loading = false } }
             do {
                 var pages: [OfficialResourceSnapshot] = []
                 if OfficialResourceInteraction.supportsPaging(operation) {
                     let values = OfficialResourceInteraction.queryValues(operation.defaultQuery)
-                    var offset = max(0, Int(values["offset"] ?? "0") ?? 0)
+                    let offset = max(0, Int(values["offset"] ?? "0") ?? 0)
                     let limit = min(200, max(1, Int(values["limit"] ?? "50") ?? 50))
-                    var loadedResponseItems = 0
-                    for _ in 0..<500 {
-                        let query = OfficialResourceInteraction.pageQuery(operation.defaultQuery, offset: offset, limit: limit)
+                    var pagination = UniFiPagination(offset: offset)
+                    while true {
+                        let query = OfficialResourceInteraction.pageQuery(operation.defaultQuery, offset: pagination.offset, limit: limit)
                         let response = try await model.requestOfficialResource(operation, query: query)
+                        try Task.checkCancellation()
                         guard loadToken == token else { return }
-                        let page = try OfficialResourcePresenter.parse(response, moduleID: moduleID)
-                        pages.append(page)
-                        loadedResponseItems += page.items.count
-                        if page.hasReportedTotalCount {
-                            model.status = "正在读取\(operation.title.replacingOccurrences(of: "列出", with: ""))… \(min(loadedResponseItems, page.totalCount)) / \(page.totalCount)"
+                        let page = try OfficialResourcePresenter.parsePage(response, moduleID: moduleID)
+                        pages.append(page.snapshot)
+                        let hasMore = try pagination.advance(
+                            rows: page.snapshot.items.count, totalCount: page.total, responseLimit: page.limit,
+                            responseOffset: page.offset, signature: page.signature
+                        )
+                        if !hasMore { break }
+                        if let total = pagination.totalCount {
+                            model.status = "正在读取\(operation.title.replacingOccurrences(of: "列出", with: ""))… \(pagination.offset) / \(total)"
                         }
-                        if page.items.isEmpty { break }
-                        if page.hasReportedTotalCount && loadedResponseItems >= page.totalCount { break }
-                        if !page.hasReportedTotalCount && page.items.count < limit { break }
-                        offset += page.items.count
                     }
-                    snapshot = OfficialResourceInteraction.mergePages(pages)
+                    let merged = OfficialResourceInteraction.mergePages(pages)
+                    if merged.items.count < pagination.offset - offset {
+                        throw UniFiError.invalidResponse("UniFi 返回了重复的资源，请刷新后重试。")
+                    }
+                    snapshot = merged
                 } else {
                     let response = try await model.requestOfficialResource(operation, query: operation.defaultQuery)
+                    try Task.checkCancellation()
                     guard loadToken == token else { return }
                     snapshot = try OfficialResourcePresenter.parse(response, moduleID: moduleID)
                 }
+                loadedListID = operation.id
+                loadError = nil
+                selectedItemID = nil
+                inspectorItem = nil
                 model.status = "已读取 \(snapshot.items.count) 条\(operation.title.replacingOccurrences(of: "列出", with: ""))"
             } catch {
-                snapshot = .empty
+                guard !Task.isCancelled, loadToken == token else { return }
+                loadError = error.localizedDescription
+                selectedItemID = nil
+                inspectorItem = nil
                 model.status = "读取失败：\(error.localizedDescription)"
-                model.errorMessage = error.localizedDescription
             }
         }
     }
 
     private func prepare(_ operation: OfficialAPIOperation, item: OfficialResourceItem?) {
+        guard !operation.isWrite || resourceWriteReady else { return }
         if operation.method == "PUT", let item,
            let detailOperation = OfficialResourceInteraction.detailOperation(for: selectedOperation, operations: operations),
            detailOperation.pathParameters.allSatisfy({ $0.lowercased().hasSuffix("id") }) {

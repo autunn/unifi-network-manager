@@ -1,4 +1,4 @@
-# UniFi Policy Manager for macOS
+# UniFi Network Manager for macOS
 
 Native macOS port built with SwiftUI and the official Ubiquiti Integration API.
 
@@ -25,7 +25,7 @@ Native macOS port built with SwiftUI and the official Ubiquiti Integration API.
   strict synchronization, snapshot recovery and ordering restoration
 - System and derived policies remain read-only
 - API Key storage in macOS Keychain
-- Automatic live DNS, ACL and firewall baseline snapshots before write operations
+- Automatic live DNS, ACL and firewall baseline snapshots before dedicated policy writes
 - Generic API writes show the final path/body for confirmation and log only the operation ID and method, never the request body
 - Manual baseline export
 - Offline demo mode
@@ -45,7 +45,7 @@ swift test --package-path macos
 ./macos/build-app.sh
 ```
 
-The application is written to `macos/dist/UniFi-Policy-Manager.app`, enables
+The application is written to `macos/dist/UniFi-Network-Manager.app`, enables
 Hardened Runtime, and receives an ad-hoc local signature when no Developer ID
 identity is configured. GitHub Actions packages the bundle with `ditto` so
 executable permissions and macOS metadata are preserved. The release workflow

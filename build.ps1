@@ -33,11 +33,12 @@ if (-not $DotNet -or -not (Test-Path -LiteralPath $DotNet)) {
 
 if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed." }
 
-$publishExe = Join-Path $PublishDirectory "UniFi-Policy-Manager.exe"
+$publishExe = Join-Path $PublishDirectory "UniFi-Network-Manager.exe"
 $readme = Join-Path $ProjectRoot "README.md"
 $license = Join-Path $ProjectRoot "LICENSE"
-$package = Join-Path $ProjectRoot "UniFi-Policy-Manager-$Version-win-x64.zip"
-Compress-Archive -LiteralPath @($publishExe, $readme, $license) -DestinationPath $package -CompressionLevel Optimal -Force
+$package = Join-Path $ProjectRoot "UniFi-Network-Manager-$Version-win-x64.zip"
+$docs = Join-Path $ProjectRoot "docs"
+Compress-Archive -LiteralPath @($publishExe, $readme, $license, $docs) -DestinationPath $package -CompressionLevel Optimal -Force
 
 Write-Host "Built: $publishExe"
 Write-Host "Package: $package"

@@ -62,8 +62,13 @@ enum BackupService {
         return base.appendingPathComponent("UniFiPolicyManager", isDirectory: true)
     }
 
-    static func saveSnapshot(reason: String, bundle: PolicyBundle) throws -> URL {
-        let directory = root.appendingPathComponent("backups", isDirectory: true)
+    static func backupDirectory(demo: Bool) -> URL {
+        let workspace = demo ? root.appendingPathComponent("demo", isDirectory: true) : root
+        return workspace.appendingPathComponent("backups", isDirectory: true)
+    }
+
+    static func saveSnapshot(reason: String, bundle: PolicyBundle, demo: Bool) throws -> URL {
+        let directory = backupDirectory(demo: demo)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd-HHmmss-SSS"
@@ -72,9 +77,23 @@ enum BackupService {
         return url
     }
 
-    static func log(_ message: String) {
+    static func latestSnapshot(target: String, siteID: String, demo: Bool) -> URL? {
+        let directory = backupDirectory(demo: demo)
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+        ) else { return nil }
+        return urls.filter { $0.pathExtension == "json" }
+            .sorted { $0.lastPathComponent > $1.lastPathComponent }
+            .first { url in
+                guard let bundle = try? PolicyBundleCodec.load(url) else { return false }
+                return bundle.matchesSite(target: target, siteID: siteID)
+            }
+    }
+
+    static func log(_ message: String, demo: Bool) {
         do {
-            let directory = root.appendingPathComponent("logs", isDirectory: true)
+            let workspace = demo ? root.appendingPathComponent("demo", isDirectory: true) : root
+            let directory = workspace.appendingPathComponent("logs", isDirectory: true)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let url = directory.appendingPathComponent("operations.log")
             let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"

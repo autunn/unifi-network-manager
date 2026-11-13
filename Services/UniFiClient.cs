@@ -48,7 +48,7 @@ public sealed class UniFiClient : IUniFiClient
             Timeout = TimeSpan.FromSeconds(30)
         };
         _httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        _httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("UniFi-Policy-Manager/4.1.1");
+        _httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("UniFi-Network-Manager/4.1.1");
         _httpClient.DefaultRequestHeaders.TryAddWithoutValidation("X-API-Key", apiKey);
     }
 
@@ -90,61 +90,13 @@ public sealed class UniFiClient : IUniFiClient
         _selectedSite = site;
     }
 
-    public async Task<IReadOnlyList<UniFiSite>> ListSitesAsync(CancellationToken cancellationToken = default)
-    {
-        var result = new List<UniFiSite>();
-        var offset = 0;
-        while (true)
-        {
-            using var document = await SendAsync(HttpMethod.Get, $"{ApiRoot}/sites?offset={offset}&limit={PageSize}", null, cancellationToken);
-            var root = document.RootElement;
-            if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array)
-                throw new UniFiApiException("UniFi 站点列表响应格式不正确。");
+    public Task<IReadOnlyList<UniFiSite>> ListSitesAsync(CancellationToken cancellationToken = default) =>
+        ReadPagesAsync($"{ApiRoot}/sites", item => new UniFiSite(
+            GetRequiredString(item, "id"), GetRequiredString(item, "internalReference"), GetRequiredString(item, "name")),
+            cancellationToken);
 
-            foreach (var item in data.EnumerateArray())
-            {
-                var id = GetRequiredString(item, "id");
-                var internalReference = GetRequiredString(item, "internalReference");
-                var name = GetRequiredString(item, "name");
-                result.Add(new UniFiSite(id, internalReference, name));
-            }
-
-            var count = root.TryGetProperty("count", out var countElement) && countElement.TryGetInt32(out var pageCount)
-                ? pageCount
-                : data.GetArrayLength();
-            var total = root.TryGetProperty("totalCount", out var totalElement) && totalElement.TryGetInt64(out var totalCount)
-                ? totalCount
-                : result.Count;
-            offset += count;
-            if (count == 0 || offset >= total) break;
-        }
-        return result;
-    }
-
-    public async Task<IReadOnlyList<DnsRecord>> ListRecordsAsync(CancellationToken cancellationToken = default)
-    {
-        var result = new List<DnsRecord>();
-        var offset = 0;
-        while (true)
-        {
-            using var document = await SendAsync(HttpMethod.Get, $"{DnsPoliciesPath}?offset={offset}&limit={PageSize}", null, cancellationToken);
-            var root = document.RootElement;
-            if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array)
-                throw new UniFiApiException("UniFi DNS Policy 列表响应格式不正确。");
-
-            foreach (var item in data.EnumerateArray()) result.Add(OfficialDnsPolicyMapper.Parse(item));
-
-            var count = root.TryGetProperty("count", out var countElement) && countElement.TryGetInt32(out var pageCount)
-                ? pageCount
-                : data.GetArrayLength();
-            var total = root.TryGetProperty("totalCount", out var totalElement) && totalElement.TryGetInt64(out var totalCount)
-                ? totalCount
-                : result.Count;
-            offset += count;
-            if (count == 0 || offset >= total) break;
-        }
-        return result;
-    }
+    public Task<IReadOnlyList<DnsRecord>> ListRecordsAsync(CancellationToken cancellationToken = default) =>
+        ReadPagesAsync(DnsPoliciesPath, OfficialDnsPolicyMapper.Parse, cancellationToken);
 
     public async Task<DnsRecord?> CreateRecordAsync(DnsRecord record, CancellationToken cancellationToken = default)
     {
@@ -167,26 +119,7 @@ public sealed class UniFiClient : IUniFiClient
 
     public async Task<IReadOnlyList<OfficialPolicyRule>> ListPoliciesAsync(OfficialPolicyKind kind, CancellationToken cancellationToken = default)
     {
-        var path = GetPolicyPath(kind);
-        var result = new List<OfficialPolicyRule>();
-        var offset = 0;
-        while (true)
-        {
-            using var document = await SendAsync(HttpMethod.Get, $"{path}?offset={offset}&limit={PageSize}", null, cancellationToken);
-            var root = document.RootElement;
-            if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array)
-                throw new UniFiApiException("UniFi 策略列表响应格式不正确。");
-            foreach (var item in data.EnumerateArray()) result.Add(OfficialPolicyRule.Parse(kind, item));
-
-            var count = root.TryGetProperty("count", out var countElement) && countElement.TryGetInt32(out var pageCount)
-                ? pageCount
-                : data.GetArrayLength();
-            var total = root.TryGetProperty("totalCount", out var totalElement) && totalElement.TryGetInt64(out var totalCount)
-                ? totalCount
-                : result.Count;
-            offset += count;
-            if (count == 0 || offset >= total) break;
-        }
+        var result = await ReadPagesAsync(GetPolicyPath(kind), item => OfficialPolicyRule.Parse(kind, item), cancellationToken);
         return result.OrderBy(item => item.Index).ToList();
     }
 
@@ -328,7 +261,7 @@ public sealed class UniFiClient : IUniFiClient
         HttpResponseMessage response;
         try
         {
-            response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken);
         }
         catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -364,33 +297,46 @@ public sealed class UniFiClient : IUniFiClient
         _ => throw new ArgumentOutOfRangeException(nameof(kind))
     };
 
-    private async Task AppendReferencesAsync(string path, string kind, List<PolicyReferenceItem> result, CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<T>> ReadPagesAsync<T>(
+        string path, Func<JsonElement, T> parse, CancellationToken cancellationToken)
     {
-        var initialCount = result.Count;
-        var offset = 0;
+        var result = new List<T>();
+        var pagination = new UniFiPagination();
+        var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         while (true)
         {
-            using var document = await SendAsync(HttpMethod.Get, $"{path}?offset={offset}&limit={PageSize}", null, cancellationToken);
+            using var document = await SendAsync(HttpMethod.Get, $"{path}?offset={pagination.Offset}&limit={PageSize}", null, cancellationToken);
             var root = document.RootElement;
-            if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array) break;
+            if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array)
+                throw new UniFiApiException("UniFi 列表响应格式不正确。");
+            var hasMore = pagination.Advance(data.GetArrayLength(), UniFiPagination.ReadTotalCount(root),
+                UniFiPagination.ReadNonNegativeInt(root, "limit"), UniFiPagination.ReadNonNegativeInt(root, "offset"));
             foreach (var item in data.EnumerateArray())
             {
-                var id = GetRequiredString(item, "id");
-                var name = item.TryGetProperty("name", out var nameElement) && nameElement.ValueKind == JsonValueKind.String
-                    ? nameElement.GetString() ?? id
-                    : id;
-                result.Add(new PolicyReferenceItem(id, name, kind));
+                if (item.ValueKind != JsonValueKind.Object)
+                    throw new UniFiApiException("UniFi 列表包含无效的资源对象。");
+                if (!seenIds.Add(GetRequiredString(item, "id")))
+                    throw new UniFiApiException("UniFi 列表包含重复的资源 ID，请刷新后重试。");
+                result.Add(parse(item));
             }
-            var count = root.TryGetProperty("count", out var countElement) && countElement.TryGetInt32(out var pageCount) ? pageCount : data.GetArrayLength();
-            var total = root.TryGetProperty("totalCount", out var totalElement) && totalElement.TryGetInt64(out var totalCount) ? totalCount : result.Count - initialCount;
-            offset += count;
-            if (count == 0 || offset >= total) break;
+            if (!hasMore) return result;
         }
     }
 
     private async Task TryAppendReferencesAsync(string path, string kind, List<PolicyReferenceItem> result, CancellationToken cancellationToken)
     {
-        try { await AppendReferencesAsync(path, kind, result, cancellationToken); }
+        try
+        {
+            var items = await ReadPagesAsync(path, item =>
+            {
+                var id = GetRequiredString(item, "id");
+                var name = item.TryGetProperty("name", out var value) && value.ValueKind == JsonValueKind.String
+                    ? value.GetString() ?? id
+                    : id;
+                return new PolicyReferenceItem(id, name, kind);
+            }, cancellationToken);
+            result.AddRange(items);
+        }
         catch (UniFiApiException exception) when (exception.StatusCode is 403 or 404) { }
     }
 

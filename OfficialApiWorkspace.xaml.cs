@@ -10,10 +10,11 @@ namespace UniFiDnsManager;
 public partial class OfficialApiWorkspace : UserControl
 {
     private readonly ObservableCollection<OfficialApiOperation> _visibleOperations = [];
-    private readonly BackupService _auditService = new();
+    private BackupService? _auditService;
     private IReadOnlyList<OfficialApiOperation> _moduleOperations = [];
     private IUniFiClient? _client;
     private OfficialApiOperation? _selectedOperation;
+    private bool _isBusy;
 
     public event EventHandler<string>? StatusChanged;
 
@@ -28,6 +29,8 @@ public partial class OfficialApiWorkspace : UserControl
         _client = client;
         UpdateExecuteState();
     }
+
+    public void SetAuditService(BackupService auditService) => _auditService = auditService;
 
     public void ShowModule(string moduleId)
     {
@@ -105,22 +108,22 @@ public partial class OfficialApiWorkspace : UserControl
         }
     }
 
-    private void UpdateExecuteState() => ExecuteButton.IsEnabled = _client is not null && _selectedOperation is not null;
+    private void UpdateExecuteState() => ExecuteButton.IsEnabled = !_isBusy && _client is not null && _selectedOperation is not null;
 
     private async void ExecuteButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_client is null || _selectedOperation is null) return;
+        if (_isBusy || _client is not { } client || _selectedOperation is not { } operation) return;
         try
         {
-            var path = _selectedOperation.ResolvePath(_client.SiteId, ParsePathParameters(requireValues: true));
+            var path = operation.ResolvePath(client.SiteId, ParsePathParameters(requireValues: true));
             var query = NormalizeQuery(QueryTextBox.Text);
-            _selectedOperation.ValidateQuery(query);
+            operation.ValidateQuery(query);
             if (query.Length > 0) path += $"?{query}";
-            var body = _selectedOperation.HasBody ? NormalizeJson(RequestBodyTextBox.Text) : null;
+            var body = operation.HasBody ? NormalizeJson(RequestBodyTextBox.Text) : null;
 
-            if (_selectedOperation.IsWrite)
+            if (operation.IsWrite)
             {
-                var confirmation = $"即将调用官方端点：\n\n{_selectedOperation.Method} {path}\n\n" +
+                var confirmation = $"即将调用官方端点：\n\n{operation.Method} {path}\n\n" +
                     (body is null ? string.Empty : $"请求体：\n{body}\n\n") +
                     "此操作会直接修改 UniFi。是否继续？";
                 if (MessageBox.Show(Window.GetWindow(this), confirmation, "确认执行官方写操作", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
@@ -128,29 +131,36 @@ public partial class OfficialApiWorkspace : UserControl
             }
 
             SetBusy(true);
-            StatusChanged?.Invoke(this, $"正在执行 {_selectedOperation.Title}…");
-            ResponseTextBox.Text = await _client.ExecuteOfficialApiAsync(_selectedOperation.Method, path, body);
-            if (_selectedOperation.IsWrite)
+            StatusChanged?.Invoke(this, $"正在执行 {operation.Title}…");
+            var response = await client.ExecuteOfficialApiAsync(operation.Method, path, body);
+            if (operation.IsWrite)
             {
+                _auditService ??= new BackupService();
                 await _auditService.LogOperationAsync(new
                 {
                     kind = "official_api",
-                    operationId = _selectedOperation.Id,
-                    method = _selectedOperation.Method
+                    operationId = operation.Id,
+                    method = operation.Method
                 });
             }
-            StatusChanged?.Invoke(this, $"{_selectedOperation.Title}执行成功。");
+            if (!IsCurrentRequest(client, operation)) return;
+            ResponseTextBox.Text = response;
+            StatusChanged?.Invoke(this, $"{operation.Title}执行成功。");
         }
         catch (Exception ex)
         {
+            if (!IsCurrentRequest(client, operation)) return;
             ResponseTextBox.Text = ex is UniFiApiException api && !string.IsNullOrWhiteSpace(api.Details)
                 ? $"{ex.Message}\n\n{api.Details}"
                 : ex.Message;
-            StatusChanged?.Invoke(this, $"{_selectedOperation.Title}执行失败：{ex.Message}");
+            StatusChanged?.Invoke(this, $"{operation.Title}执行失败：{ex.Message}");
             MessageBox.Show(Window.GetWindow(this), ex.Message, "官方 API 请求失败", MessageBoxButton.OK, MessageBoxImage.Error);
         }
         finally { SetBusy(false); }
     }
+
+    private bool IsCurrentRequest(IUniFiClient client, OfficialApiOperation operation) =>
+        ReferenceEquals(_client, client) && ReferenceEquals(_selectedOperation, operation);
 
     private Dictionary<string, string> ParsePathParameters(bool requireValues)
     {
@@ -192,8 +202,10 @@ public partial class OfficialApiWorkspace : UserControl
 
     private void SetBusy(bool busy)
     {
-        ExecuteButton.IsEnabled = !busy && _client is not null && _selectedOperation is not null;
+        _isBusy = busy;
+        UpdateExecuteState();
         ExecuteButton.Content = busy ? "正在执行…" : "执行官方请求";
-        OperationListBox.IsHitTestVisible = !busy;
+        OperationListBox.IsEnabled = !busy;
+        OperationSearchTextBox.IsEnabled = !busy;
     }
 }

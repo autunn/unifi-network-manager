@@ -40,9 +40,20 @@ jobs:
           -p:PublishTrimmed=false
           --output artifact
 
+      - name: Run Windows self-test
+        shell: pwsh
+        run: |
+          $report = Join-Path $PWD "self-test.json"
+          $arguments = @("--self-test", ('--self-test-output="{0}"' -f $report))
+          $process = Start-Process -FilePath "./artifact/UniFi-Network-Manager.exe" -ArgumentList $arguments -WindowStyle Hidden -Wait -PassThru
+          if (Test-Path -LiteralPath $report) { Get-Content -LiteralPath $report }
+          if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $report)) {
+            throw "Windows self-test failed."
+          }
+
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v6
         with:
-          name: UniFi-Policy-Manager-win-x64
+          name: UniFi-Network-Manager-win-x64
           path: artifact/**
           if-no-files-found: error

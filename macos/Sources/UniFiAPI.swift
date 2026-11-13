@@ -1,4 +1,6 @@
 import Foundation
+import CoreFoundation
+import CryptoKit
 
 enum UniFiError: LocalizedError {
     case invalidHost
@@ -10,6 +12,55 @@ enum UniFiError: LocalizedError {
         case .invalidHost: return "UCG 地址格式不正确，只填写 IP 或主机名。"
         case .api(let message), .invalidResponse(let message): return message
         }
+    }
+}
+
+struct UniFiPagination {
+    private static let maximumPages = 500
+    private var pageCount = 0
+    private var pageSignatures: Set<Data> = []
+    private(set) var offset: Int
+    private(set) var totalCount: Int?
+
+    init(offset: Int = 0) { self.offset = offset }
+
+    mutating func advance(
+        rows: Int, totalCount: Int? = nil, responseLimit: Int? = nil,
+        responseOffset: Int? = nil, signature: Data? = nil
+    ) throws -> Bool {
+        if let responseOffset, responseOffset != offset {
+            throw UniFiError.invalidResponse("UniFi 返回了错误的分页偏移量，无法读取完整列表。")
+        }
+        if rows > 0, let signature, !pageSignatures.insert(signature).inserted {
+            throw UniFiError.invalidResponse("UniFi 返回了重复的分页，无法读取完整列表。")
+        }
+        self.totalCount = totalCount ?? self.totalCount
+        let (nextOffset, overflow) = offset.addingReportingOverflow(rows)
+        guard !overflow else { throw UniFiError.invalidResponse("UniFi 返回了无效的分页偏移量。") }
+        offset = nextOffset
+        if let total = self.totalCount {
+            if offset >= total { return false }
+            if rows == 0 { throw UniFiError.invalidResponse("UniFi 提前返回空页，列表读取不完整。") }
+        } else if rows == 0 || (responseLimit.map { $0 > 0 && rows < $0 } ?? false) {
+            return false
+        }
+
+        pageCount += 1
+        guard pageCount < Self.maximumPages else {
+            throw UniFiError.invalidResponse("UniFi 列表超过分页上限，请缩小查询范围后重试。")
+        }
+        return true
+    }
+
+    static func nonNegativeInt(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              let integer = number as? Int, integer >= 0 else { return nil }
+        return integer
+    }
+
+    static func pageSignature(_ rows: [[String: Any]]) throws -> Data {
+        let data = try JSONSerialization.data(withJSONObject: rows, options: [.sortedKeys])
+        return Data(SHA256.hash(data: data))
     }
 }
 
@@ -58,7 +109,7 @@ final class UniFiAPI: @unchecked Sendable {
         delegate = TLSDelegate(verifyTLS: verifyTLS)
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 30
-        configuration.httpAdditionalHeaders = ["User-Agent": "UniFi-Policy-Manager-macOS/1.0"]
+        configuration.httpAdditionalHeaders = ["User-Agent": "UniFi-Network-Manager-macOS/1.0"]
         session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
     }
 
@@ -208,18 +259,28 @@ final class UniFiAPI: @unchecked Sendable {
 
     private func paged(path: String) async throws -> [[String: Any]] {
         var output: [[String: Any]] = []
-        var offset = 0
+        var pagination = UniFiPagination()
+        var seenIDs = Set<String>()
+        let separator = path.contains("?") ? "&" : "?"
         while true {
-            let separator = path.contains("?") ? "&" : "?"
-            let root = try await request(path: "\(path)\(separator)offset=\(offset)&limit=200")
+            let root = try await request(path: "\(path)\(separator)offset=\(pagination.offset)&limit=200")
             guard let data = root["data"] as? [[String: Any]] else { throw UniFiError.invalidResponse("UniFi 列表响应格式不正确。") }
+            for item in data {
+                guard let id = item["id"] as? String, !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw UniFiError.invalidResponse("UniFi 响应缺少字段：id")
+                }
+                if !seenIDs.insert(id.lowercased()).inserted {
+                    throw UniFiError.invalidResponse("UniFi 列表包含重复的资源 ID，请刷新后重试。")
+                }
+            }
             output += data
-            let count = root["count"] as? Int ?? data.count
-            let total = root["totalCount"] as? Int ?? output.count
-            offset += count
-            if count == 0 || offset >= total { break }
+            let hasMore = try pagination.advance(
+                rows: data.count, totalCount: UniFiPagination.nonNegativeInt(root["totalCount"]),
+                responseLimit: UniFiPagination.nonNegativeInt(root["limit"]),
+                responseOffset: UniFiPagination.nonNegativeInt(root["offset"])
+            )
+            if !hasMore { return output }
         }
-        return output
     }
 
     private func request(path: String, method: String = "GET", body: [String: Any]? = nil) async throws -> [String: Any] {

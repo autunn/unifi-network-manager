@@ -60,7 +60,7 @@ struct LoginView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     BrandView(compact: false)
                     Spacer()
-                    Text("UniFi 策略管理")
+                    Text("UniFi 网络管理")
                         .font(.system(size: 35, weight: .bold))
                         .foregroundStyle(.white)
                     Text("覆盖 UniFi Network 官方 Integration API 的 44 条路径、73 个操作，并保留 DNS、ACL 与防火墙专用管理流程。")
@@ -167,7 +167,7 @@ struct BrandView: View {
             }
             .frame(width: compact ? 34 : 40, height: compact ? 34 : 40)
             VStack(alignment: .leading, spacing: 1) {
-                Text(compact ? "Policy Manager" : "UniFi Policy Manager").font(.system(size: compact ? 15 : 17, weight: .bold)).foregroundStyle(.white)
+                Text(compact ? "Network Manager" : "UniFi Network Manager").font(.system(size: compact ? 15 : 17, weight: .bold)).foregroundStyle(.white)
                 Text("OFFICIAL API").font(.system(size: 9, weight: .bold)).foregroundStyle(Color(red: 0.35, green: 0.68, blue: 1.0))
             }
         }
@@ -298,12 +298,12 @@ private struct WorkspaceToolbar: ToolbarContent {
     @EnvironmentObject var model: AppModel
     var body: some ToolbarContent {
         ToolbarItemGroup {
-            Button { model.refreshAll() } label: { Label("刷新", systemImage: "arrow.clockwise") }.help("刷新全部策略")
-            Button { model.exportBaseline() } label: { Label("导出基线", systemImage: "square.and.arrow.up") }.help("导出当前完整策略基线")
+            Button { model.refreshAll() } label: { Label("刷新", systemImage: "arrow.clockwise") }.help("刷新全部策略").disabled(model.busy)
+            Button { model.exportBaseline() } label: { Label("导出基线", systemImage: "square.and.arrow.up") }.help("导出当前完整策略基线").disabled(model.busy)
             Menu {
                 Button("打开备份目录", systemImage: "folder") { model.revealBackups() }
                 Divider()
-                Button("断开连接", systemImage: "rectangle.portrait.and.arrow.right", role: .destructive) { model.disconnect() }
+                Button("断开连接", systemImage: "rectangle.portrait.and.arrow.right", role: .destructive) { model.disconnect() }.disabled(model.busy)
             } label: { Label("更多", systemImage: "ellipsis.circle") }
         }
     }

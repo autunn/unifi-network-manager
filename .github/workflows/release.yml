@@ -106,7 +106,7 @@ jobs:
         run: |
           $output = Join-Path $PWD "dist/self-test.json"
           $process = Start-Process `
-            -FilePath "dist/win-x64/UniFi-Policy-Manager.exe" `
+            -FilePath "dist/win-x64/UniFi-Network-Manager.exe" `
             -ArgumentList @("--self-test", "--self-test-output=$output") `
             -Wait -PassThru
           Get-Content -LiteralPath $output
@@ -148,10 +148,10 @@ jobs:
             /td SHA256 `
             /tr http://timestamp.digicert.com `
             /sha1 $certificate.Thumbprint `
-            "dist/win-x64/UniFi-Policy-Manager.exe"
+            "dist/win-x64/UniFi-Network-Manager.exe"
           if ($LASTEXITCODE -ne 0) { throw "Authenticode signing failed." }
 
-          & $signTool.FullName verify /pa /v "dist/win-x64/UniFi-Policy-Manager.exe"
+          & $signTool.FullName verify /pa /v "dist/win-x64/UniFi-Network-Manager.exe"
           if ($LASTEXITCODE -ne 0) { throw "Authenticode verification failed." }
 
       - name: Report unsigned Windows build
@@ -166,17 +166,17 @@ jobs:
         run: |
           $packageDirectory = "dist/package-windows"
           New-Item -ItemType Directory -Path $packageDirectory | Out-Null
-          Copy-Item -LiteralPath "dist/win-x64/UniFi-Policy-Manager.exe", "README.md", "LICENSE" -Destination $packageDirectory
+          Copy-Item -LiteralPath "dist/win-x64/UniFi-Network-Manager.exe", "README.md", "LICENSE", "docs" -Destination $packageDirectory -Recurse
           Compress-Archive `
             -Path "$packageDirectory/*" `
-            -DestinationPath "dist/UniFi-Policy-Manager-$env:RELEASE_VERSION-win-x64.zip" `
+            -DestinationPath "dist/UniFi-Network-Manager-$env:RELEASE_VERSION-win-x64.zip" `
             -CompressionLevel Optimal
 
       - name: Upload Windows package
         uses: actions/upload-artifact@v6
         with:
           name: release-windows
-          path: dist/UniFi-Policy-Manager-${{ needs.validate.outputs.version }}-win-x64.zip
+          path: dist/UniFi-Network-Manager-${{ needs.validate.outputs.version }}-win-x64.zip
           if-no-files-found: error
 
   macos:
@@ -233,8 +233,8 @@ jobs:
 
       - name: Verify application signature
         run: |
-          codesign --verify --deep --strict --verbose=2 macos/dist/UniFi-Policy-Manager.app
-          codesign --display --verbose=4 macos/dist/UniFi-Policy-Manager.app
+          codesign --verify --deep --strict --verbose=2 macos/dist/UniFi-Network-Manager.app
+          codesign --display --verbose=4 macos/dist/UniFi-Network-Manager.app
 
       - name: Report ad-hoc macOS build
         if: ${{ env.APPLE_CERTIFICATE_P12_BASE64 == '' }}
@@ -244,7 +244,7 @@ jobs:
         if: ${{ env.APPLE_CERTIFICATE_P12_BASE64 != '' && env.APPLE_ID != '' && env.APPLE_TEAM_ID != '' && env.APPLE_APP_SPECIFIC_PASSWORD != '' }}
         run: >-
           ditto -c -k --sequesterRsrc --keepParent
-          macos/dist/UniFi-Policy-Manager.app
+          macos/dist/UniFi-Network-Manager.app
           macos/dist/notarization-upload.zip
 
       - name: Notarize and staple macOS application
@@ -256,9 +256,9 @@ jobs:
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --wait
-          xcrun stapler staple macos/dist/UniFi-Policy-Manager.app
-          xcrun stapler validate macos/dist/UniFi-Policy-Manager.app
-          spctl --assess --type execute --verbose=4 macos/dist/UniFi-Policy-Manager.app
+          xcrun stapler staple macos/dist/UniFi-Network-Manager.app
+          xcrun stapler validate macos/dist/UniFi-Network-Manager.app
+          spctl --assess --type execute --verbose=4 macos/dist/UniFi-Network-Manager.app
 
       - name: Report signed but unnotarized macOS build
         if: ${{ env.APPLE_CERTIFICATE_P12_BASE64 != '' && (env.APPLE_ID == '' || env.APPLE_TEAM_ID == '' || env.APPLE_APP_SPECIFIC_PASSWORD == '') }}
@@ -269,14 +269,14 @@ jobs:
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
         run: >-
           ditto -c -k --sequesterRsrc --keepParent
-          macos/dist/UniFi-Policy-Manager.app
-          macos/dist/UniFi-Policy-Manager-$RELEASE_VERSION-macOS.zip
+          macos/dist/UniFi-Network-Manager.app
+          macos/dist/UniFi-Network-Manager-$RELEASE_VERSION-macOS.zip
 
       - name: Upload macOS package
         uses: actions/upload-artifact@v6
         with:
           name: release-macos
-          path: macos/dist/UniFi-Policy-Manager-${{ needs.validate.outputs.version }}-macOS.zip
+          path: macos/dist/UniFi-Network-Manager-${{ needs.validate.outputs.version }}-macOS.zip
           if-no-files-found: error
 
   release:
@@ -328,7 +328,7 @@ jobs:
             dist/SHA256SUMS.txt
             --repo "$GITHUB_REPOSITORY"
             --target "$GITHUB_SHA"
-            --title "UniFi Policy Manager $RELEASE_VERSION"
+            --title "UniFi Network Manager $RELEASE_VERSION"
             --generate-notes
           )
           if [[ "$PRERELEASE" == "true" ]]; then

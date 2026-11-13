@@ -23,13 +23,31 @@ public static class OfficialResourcePresentationService
     public static OfficialResourceSnapshot Parse(string json, string moduleId)
     {
         using var document = JsonDocument.Parse(json);
-        var elements = ExtractResourceElements(document.RootElement);
+        return ParseRoot(document.RootElement, moduleId, allowSingle: true);
+    }
+
+    internal static (OfficialResourceSnapshot Snapshot, long? Total, int? Limit, int? Offset, string Signature) ParsePage(string json, string moduleId)
+    {
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+        var snapshot = ParseRoot(root, moduleId, allowSingle: false);
+        var signature = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
+            JsonSerializer.Serialize(snapshot.Items.Select(item => item.RawJson)))));
+        return (snapshot, UniFiPagination.ReadTotalCount(root), UniFiPagination.ReadNonNegativeInt(root, "limit"),
+            UniFiPagination.ReadNonNegativeInt(root, "offset"), signature);
+    }
+
+    private static OfficialResourceSnapshot ParseRoot(JsonElement root, string moduleId, bool allowSingle)
+    {
+        var elements = ExtractResourceElements(root, allowSingle);
+        if (!allowSingle && elements.Any(element => element.ValueKind != JsonValueKind.Object))
+            throw new UniFiApiException("UniFi 列表包含无效的资源对象。");
         var items = elements
             .Where(element => element.ValueKind == JsonValueKind.Object)
             .Select(element => BuildItem(element, moduleId))
             .ToList();
 
-        var reportedTotal = ReadTotalCount(document.RootElement);
+        var reportedTotal = UniFiPagination.ReadNonNegativeInt(root, "totalCount");
         return CreateSnapshot(items, Math.Max(reportedTotal ?? items.Count, items.Count), reportedTotal.HasValue);
     }
 
@@ -79,10 +97,13 @@ public static class OfficialResourcePresentationService
         };
     }
 
-    private static IReadOnlyList<JsonElement> ExtractResourceElements(JsonElement root)
+    private static IReadOnlyList<JsonElement> ExtractResourceElements(JsonElement root, bool allowSingle)
     {
         if (root.ValueKind == JsonValueKind.Array) return root.EnumerateArray().Select(item => item.Clone()).ToList();
-        if (root.ValueKind != JsonValueKind.Object) return [];
+        if (root.ValueKind != JsonValueKind.Object)
+            return allowSingle ? [] : throw new UniFiApiException("UniFi 列表响应格式不正确。");
+        if (!allowSingle && TryGetProperty(root, "data", out var data) && data.ValueKind != JsonValueKind.Array)
+            throw new UniFiApiException("UniFi 列表响应格式不正确。");
 
         foreach (var preferred in new[] { "data", "items", "results", "devices", "clients", "networks", "broadcasts", "vouchers", "policies", "zones" })
         {
@@ -92,12 +113,12 @@ public static class OfficialResourcePresentationService
 
         foreach (var property in root.EnumerateObject())
         {
-            if (property.Value.ValueKind == JsonValueKind.Array && property.Value.GetArrayLength() > 0
+            if (property.Value.ValueKind == JsonValueKind.Array && (!allowSingle || property.Value.GetArrayLength() > 0)
                 && property.Value.EnumerateArray().All(item => item.ValueKind == JsonValueKind.Object))
                 return property.Value.EnumerateArray().Select(item => item.Clone()).ToList();
         }
 
-        return [root.Clone()];
+        return allowSingle ? [root.Clone()] : throw new UniFiApiException("UniFi 列表响应格式不正确。");
     }
 
     private static OfficialResourceItem BuildItem(JsonElement element, string moduleId)
@@ -208,16 +229,6 @@ public static class OfficialResourcePresentationService
             && DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var date))
             return date.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.CurrentCulture);
         return value;
-    }
-
-    private static int? ReadTotalCount(JsonElement root)
-    {
-        if (root.ValueKind != JsonValueKind.Object) return null;
-        foreach (var key in new[] { "totalCount", "count" })
-        {
-            if (TryGetProperty(root, key, out var value) && value.TryGetInt32(out var count)) return count;
-        }
-        return null;
     }
 
     private static string? Candidate(IReadOnlyDictionary<string, string> values, params string[] candidates)

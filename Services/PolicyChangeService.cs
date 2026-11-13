@@ -27,13 +27,24 @@ public static class PolicyChangeService
             if (document.RootElement.ValueKind != JsonValueKind.Object)
                 throw new ValidationException("策略文件必须是 JSON 对象。");
 
-            var bundle = document.RootElement.Deserialize<PolicyBundle>(JsonOptions) ?? new PolicyBundle();
-            bundle.HasDnsSection = document.RootElement.TryGetProperty("dns_records", out _) || document.RootElement.TryGetProperty("records", out _);
-            bundle.HasAclSection = document.RootElement.TryGetProperty("acl_rules", out _);
-            bundle.HasFirewallSection = document.RootElement.TryGetProperty("firewall_policies", out _);
-            if (bundle.DnsRecords.Count == 0 && document.RootElement.TryGetProperty("records", out var legacyRecords) && legacyRecords.ValueKind == JsonValueKind.Array)
+            var root = document.RootElement;
+            var hasDns = HasObjectArray(root, "dns_records", out _);
+            var hasLegacyDns = HasObjectArray(root, "records", out var legacyRecords);
+            var hasAcl = HasObjectArray(root, "acl_rules", out _);
+            var hasFirewall = HasObjectArray(root, "firewall_policies", out _);
+            if (!hasDns && !hasLegacyDns && !hasAcl && !hasFirewall)
+                throw new ValidationException("策略文件缺少 DNS、ACL 或防火墙规则数组。");
+            ValidateOrdering(root, "acl_ordering", "ordered_acl_rule_ids");
+            ValidateOrdering(root, "firewall_ordering", "before_system_defined", "after_system_defined");
+
+            var bundle = root.Deserialize<PolicyBundle>(JsonOptions) ?? new PolicyBundle();
+            bundle.HasDnsSection = hasDns || hasLegacyDns;
+            bundle.HasAclSection = hasAcl;
+            bundle.HasFirewallSection = hasFirewall;
+            if (bundle.DnsRecords.Count == 0 && hasLegacyDns)
                 bundle.DnsRecords = legacyRecords.Deserialize<List<DnsRecord>>(JsonOptions) ?? [];
-            foreach (var record in bundle.DnsRecords.Where(record => record.RecordType == "SRV")) record.PopulateSrvParts();
+            foreach (var record in bundle.DnsRecords.Where(record => record.RecordType == "SRV" && !string.IsNullOrWhiteSpace(record.Key)))
+                record.PopulateSrvParts();
             bundle.AclRules = CloneElements(bundle.AclRules);
             bundle.FirewallPolicies = CloneElements(bundle.FirewallPolicies);
             return bundle;
@@ -49,18 +60,95 @@ public static class PolicyChangeService
         await File.WriteAllTextAsync(path, JsonSerializer.Serialize(bundle, JsonOptions), cancellationToken);
     }
 
+    private static bool HasObjectArray(JsonElement root, string name, out JsonElement value)
+    {
+        if (!TryGetField(root, name, out value)) return false;
+        if (value.ValueKind != JsonValueKind.Array || value.EnumerateArray().Any(item => item.ValueKind != JsonValueKind.Object))
+            throw new ValidationException($"策略文件中的 {name} 必须是对象数组。");
+        return true;
+    }
+
+    private static void ValidateOrdering(JsonElement root, string name, params string[] arrayFields)
+    {
+        if (!TryGetField(root, name, out var value) || value.ValueKind == JsonValueKind.Null) return;
+        if (value.ValueKind != JsonValueKind.Object)
+            throw new ValidationException($"策略文件中的 {name} 必须是对象。");
+        foreach (var field in arrayFields)
+        {
+            if (TryGetField(value, field, out var ids) && (ids.ValueKind != JsonValueKind.Array ||
+                ids.EnumerateArray().Any(id => id.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(id.GetString()))))
+                throw new ValidationException($"策略文件中的 {name}.{field} 必须是有效 ID 数组。");
+        }
+    }
+
+    private static bool TryGetField(JsonElement element, string name, out JsonElement value)
+    {
+        value = default;
+        foreach (var property in element.EnumerateObject())
+        {
+            if (!property.Name.Equals(name, StringComparison.OrdinalIgnoreCase)) continue;
+            if (value.ValueKind != JsonValueKind.Undefined)
+                throw new ValidationException($"策略文件中重复定义了 {name}。");
+            value = property.Value;
+        }
+        return value.ValueKind != JsonValueKind.Undefined;
+    }
+
+    public static PolicyChangePlan BuildPlan(PolicyBundle bundle, string sourcePath, PolicyBundle current, bool synchronizeDeletes) =>
+        BuildPlan(bundle, sourcePath, current.DnsRecords,
+            current.AclRules.Select(item => OfficialPolicyRule.Parse(OfficialPolicyKind.Acl, item)).ToList(),
+            current.FirewallPolicies.Select(item => OfficialPolicyRule.Parse(OfficialPolicyKind.Firewall, item)).ToList(),
+            synchronizeDeletes, matchSourceIds: IsSameSite(bundle, current.Target, current.SiteId));
+
+    public static bool IsSameSite(PolicyBundle bundle, string? target, string? siteId) =>
+        !string.IsNullOrWhiteSpace(bundle.Target) && !string.IsNullOrWhiteSpace(bundle.SiteId) &&
+        string.Equals(bundle.Target, target, StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(bundle.SiteId, siteId, StringComparison.OrdinalIgnoreCase);
+
+    public static bool PreviewMatches(PolicyChangePlan plan, PolicyBundle preview, PolicyBundle current)
+    {
+        var bundle = plan.Bundle;
+        if (!IsSameSite(preview, current.Target, current.SiteId)) return false;
+        if (bundle.HasDnsSection)
+        {
+            var previousDns = preview.DnsRecords.OrderBy(record => record.Id, StringComparer.OrdinalIgnoreCase).ToList();
+            var currentDns = current.DnsRecords.OrderBy(record => record.Id, StringComparer.OrdinalIgnoreCase).ToList();
+            if (previousDns.Count != currentDns.Count || previousDns.Zip(currentDns).Any(pair =>
+                !string.Equals(pair.First.Id, pair.Second.Id, StringComparison.OrdinalIgnoreCase) || !DnsContentEquals(pair.First, pair.Second)))
+                return false;
+        }
+        if (bundle.HasAclSection && !PolicyListsEqual(preview.AclRules, current.AclRules)) return false;
+        if (bundle.HasFirewallSection && !PolicyListsEqual(preview.FirewallPolicies, current.FirewallPolicies)) return false;
+        if (!plan.SynchronizeDeletes) return true;
+        return (bundle.AclOrdering is null || PolicyOrderingEquals(preview.AclOrdering, current.AclOrdering)) &&
+               (bundle.FirewallOrdering is null || PolicyOrderingEquals(preview.FirewallOrdering, current.FirewallOrdering));
+    }
+
+    private static bool PolicyListsEqual(IReadOnlyList<JsonElement> left, IReadOnlyList<JsonElement> right) =>
+        left.Count == right.Count &&
+        left.OrderBy(GetPolicyId, StringComparer.OrdinalIgnoreCase)
+            .Zip(right.OrderBy(GetPolicyId, StringComparer.OrdinalIgnoreCase))
+            .All(pair => PolicyJsonEquals(pair.First.GetRawText(), pair.Second.GetRawText()));
+
+    private static bool PolicyOrderingEquals(PolicyOrderingSnapshot? left, PolicyOrderingSnapshot? right) =>
+        left is null || right is null ? left == right :
+        left.OrderedAclRuleIds.SequenceEqual(right.OrderedAclRuleIds, StringComparer.OrdinalIgnoreCase) &&
+        left.BeforeSystemDefined.SequenceEqual(right.BeforeSystemDefined, StringComparer.OrdinalIgnoreCase) &&
+        left.AfterSystemDefined.SequenceEqual(right.AfterSystemDefined, StringComparer.OrdinalIgnoreCase);
+
     public static PolicyChangePlan BuildPlan(
         PolicyBundle bundle,
         string sourcePath,
         IReadOnlyList<DnsRecord> currentDns,
         IReadOnlyList<OfficialPolicyRule> currentAcl,
         IReadOnlyList<OfficialPolicyRule> currentFirewall,
-        bool synchronizeDeletes)
+        bool synchronizeDeletes,
+        bool matchSourceIds = true)
     {
         var items = new List<PolicyChangeItem>();
-        if (bundle.HasDnsSection) BuildDnsItems(items, bundle.DnsRecords, currentDns, synchronizeDeletes);
-        if (bundle.HasAclSection) BuildPolicyItems(items, OfficialPolicyKind.Acl, bundle.AclRules, currentAcl, synchronizeDeletes);
-        if (bundle.HasFirewallSection) BuildPolicyItems(items, OfficialPolicyKind.Firewall, bundle.FirewallPolicies, currentFirewall, synchronizeDeletes);
+        if (bundle.HasDnsSection) BuildDnsItems(items, bundle.DnsRecords, currentDns, synchronizeDeletes, matchSourceIds);
+        if (bundle.HasAclSection) BuildPolicyItems(items, OfficialPolicyKind.Acl, bundle.AclRules, currentAcl, synchronizeDeletes, matchSourceIds);
+        if (bundle.HasFirewallSection) BuildPolicyItems(items, OfficialPolicyKind.Firewall, bundle.FirewallPolicies, currentFirewall, synchronizeDeletes, matchSourceIds);
         foreach (var item in items) item.IsSelected = item.Action is PolicyChangeAction.Add or PolicyChangeAction.Update;
         return new PolicyChangePlan
         {
@@ -113,7 +201,8 @@ public static class PolicyChangeService
         List<PolicyChangeItem> items,
         IReadOnlyList<DnsRecord> desiredRecords,
         IReadOnlyList<DnsRecord> currentRecords,
-        bool synchronizeDeletes)
+        bool synchronizeDeletes,
+        bool matchSourceIds)
     {
         var currentByKey = currentRecords
             .GroupBy(ImportService.IdentityKey, ImportService.IdentityComparer)
@@ -140,7 +229,7 @@ public static class PolicyChangeService
                 }
 
                 DnsRecord? current = null;
-                if (!string.IsNullOrWhiteSpace(desired.Id) && currentById.TryGetValue(desired.Id, out var byId) && !matchedCurrent.Contains(byId))
+                if (matchSourceIds && !string.IsNullOrWhiteSpace(desired.Id) && currentById.TryGetValue(desired.Id, out var byId) && !matchedCurrent.Contains(byId))
                     current = byId;
                 else if (currentByKey.TryGetValue(key, out var byKey))
                     current = byKey.FirstOrDefault(record => !matchedCurrent.Contains(record));
@@ -213,7 +302,8 @@ public static class PolicyChangeService
         OfficialPolicyKind kind,
         IReadOnlyList<JsonElement> desiredElements,
         IReadOnlyList<OfficialPolicyRule> currentRules,
-        bool synchronizeDeletes)
+        bool synchronizeDeletes,
+        bool matchSourceIds)
     {
         var scope = kind == OfficialPolicyKind.Acl ? PolicyChangeScope.Acl : PolicyChangeScope.Firewall;
         var currentUserRules = currentRules.Where(rule => rule.CanModify).ToList();
@@ -242,7 +332,7 @@ public static class PolicyChangeService
             {
                 var editable = ToEditablePolicyJson(kind, element);
                 var current = currentUserRules.FirstOrDefault(rule =>
-                                  !string.IsNullOrWhiteSpace(sourceId) &&
+                                  matchSourceIds && !string.IsNullOrWhiteSpace(sourceId) &&
                                   unmatchedCurrentIds.Contains(rule.Id) &&
                                   string.Equals(rule.Id, sourceId, StringComparison.OrdinalIgnoreCase))
                               ?? currentUserRules.FirstOrDefault(rule =>
@@ -347,7 +437,7 @@ public static class PolicyChangeService
         element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
 
     private static int GetInt(JsonElement element, string name) =>
-        element.TryGetProperty(name, out var value) && value.TryGetInt32(out var number) ? number : 0;
+        element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var number) ? number : 0;
 
     private static JsonElement ParseElement(string json)
     {

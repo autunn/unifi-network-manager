@@ -9,9 +9,9 @@ public sealed class BackupService
     public string RootDirectory { get; }
     public string BackupDirectory => Path.Combine(RootDirectory, "backups");
 
-    public BackupService()
+    public BackupService(string? rootDirectory = null)
     {
-        RootDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "UniFiPolicyManager");
+        RootDirectory = rootDirectory ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "UniFiPolicyManager");
         Directory.CreateDirectory(RootDirectory);
         Directory.CreateDirectory(BackupDirectory);
     }
