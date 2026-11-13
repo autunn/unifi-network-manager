@@ -27,8 +27,8 @@ Native macOS port built with SwiftUI and the official Ubiquiti Integration API.
 - API Key storage in macOS Keychain
 - Automatic live DNS, ACL and firewall baseline snapshots before dedicated policy writes
 - Generic API writes show the final path/body for confirmation and log only the operation ID and method, never the request body
-- Manual baseline export
-- Offline demo mode
+- Baseline export reads DNS, ACL and firewall policies from the connected Console. It includes ordering when the ordering endpoints return it.
+- Offline demo mode with separate backups and logs
 
 Backups and operation logs are stored in:
 
